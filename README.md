@@ -1,4 +1,4 @@
-# astrbot_plugin_switch_model
+# 模型故障自动切换
 
 Version 1.5.0 —— 自动切换模型 + 三类优先级 + 模型同步 + 失败策略
 
