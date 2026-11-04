@@ -1,9 +1,9 @@
-"""astrbot_plugin_switch_model 1.3.0 —— 模型报错自动切换 + 三类模型各自的手动优先级。
+"""astrbot_plugin_switch_model 1.4.0 —— 模型报错自动切换 + 三类模型各自的手动优先级。
 
 与 2.x 的区别
 -------------
 2.x 会自动读取每个模型的「模型能力（modalities）」，据此推断请求该路由到谁，
-并带有降级 / 报错 / 图片补挂等一整套逻辑。这一版把这些全部拿掉，回到 1.0.0 的
+并带有降级 / 报错等一整套逻辑。这一版把这些全部拿掉，回到 1.0.0 的
 简单模型：**顺序由你手动配置，插件只负责按顺序执行**。
 
 三份列表
@@ -21,8 +21,18 @@
 2. 包装 `ProviderManager.get_using_provider(_async)`，把解析结果换成该列表的首选，
    使「配置即生效」不需要保存或重启；
 3. 挂钩 `text_chat` / `text_chat_stream`，命中错误关键词时按列表顺序切换；
-4. 切换成功后改写 `agent_runner.config.model.provider_id`（可选落盘）；
+4. 切换成功后改写 `agent_runner.config.model.model.provider_id`（可选落盘）；
 5. 失败模型进入冷却期，冷却结束自动恢复候选资格。
+
+图片补挂（1.4.0）
+-----------------
+QQ 不允许 `@` 和图片放在同一条消息里，用户只能「先发图 → 再 @ 提问」。而 AstrBot 的
+`req.image_urls` 只取当前这一条事件，图片又不会写进对话历史，于是那条 @ 提问的请求里
+一张图都没有，模型只能回「图片是空的」。
+
+1.4.0 的做法：在事件总线层旁路记下最近收到的图片，等到下一条同会话的 LLM 请求时，
+在 `on_llm_request`（早于 `prepare_request_images`）把图补进 `req.image_urls`；
+同时「纯图片消息」默认不抢答，缓存下来等你追问，避免机器人对每张图自顾自评论。
 
 插件只在内存中挂钩，卸载 / 重载后自动还原，不修改 AstrBot 源码。
 """
@@ -47,7 +57,7 @@ except Exception:  # noqa: BLE001  # pragma: no cover
     _web_request = None
 
 PLUGIN_NAME = "astrbot_plugin_switch_model"
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 
 # 插件页 / 接口的挂载前缀：页面里 apiGet("models") 会打到 /api/plug/<PLUGIN_NAME>/models
 WEB_API_BASE = f"/{PLUGIN_NAME}"
@@ -99,6 +109,18 @@ _HOOKS_INSTALLED = False
 _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
 _AUDIO_EXT = {".mp3", ".wav", ".amr", ".silk", ".ogg", ".m4a", ".flac", ".aac", ".opus"}
 
+# 一次最多补挂几张图（与 AstrBot 的 max_quoted_fallback_images 保持一致）
+_MAX_BRIDGE_IMAGES = 3
+
+# 抑制正文里的 @：AstrBot 已按 platform_settings.reply_with_mention 自动 @ 提问者，
+# 模型再从历史里学一句 "@昵称(QQ号)" 就会显示成 2~3 个重复的 @。
+_NO_TEXT_MENTION_MARK = "【回复格式】不要在正文里写 @"
+_NO_TEXT_MENTION_RULE = (
+    _NO_TEXT_MENTION_MARK
+    + "昵称、@昵称(QQ号) 这类提及：平台会自动 @ 提问者，你再写一遍会在客户端显示成"
+    "重复的 @。要提到某个人时直接写名字，不要带 @。"
+)
+
 
 def _ok(data: Any = None, message: str | None = None) -> dict:
     return {"status": "ok", "message": message, "data": data if data is not None else {}}
@@ -128,6 +150,14 @@ class SwitchModelPlugin(Star):
 
         self._cooldown_until: dict[str, float] = {}
         self._last_reason: dict[str, str] = {}
+        # (模型 ID, 模式) -> 连续失败次数；成功一次即清零
+        self._failure_counts: dict[tuple[str, str], int] = {}
+        # (模型 ID, 模式) -> 已被 remove 策略移出，本次运行内不再作为候选
+        self._self_removed: set[tuple[str, str]] = set()
+        # 模式 -> 上次同步过的 AstrBot 侧模型 ID，用于判断用户是否改过
+        self._synced_providers: dict[str, str] = {}
+        # 后台同步任务（轮询 AstrBot 的主模型 / 图片转述 / 语音模型是否被改）
+        self._sync_task: Any = None
         self._switch_count = 0
         self._last_switch: tuple[float, str, str, str] | None = None
         self._current_id: str | None = None
@@ -148,6 +178,10 @@ class SwitchModelPlugin(Star):
         self._last_mode: str = MODE_TEXT
         # 「text_models 首行覆盖了 WebUI 主模型」只提示一次，避免刷屏
         self._text_override_warned = False
+        # 图片补挂：umo -> (图片引用列表, 过期时间戳)
+        self._image_cache: dict[str, tuple[list[str], float]] = {}
+        # EventBus._print_event 的原始实现（旁路观察消息里的图片）
+        self._image_hook_orig: Any = None
 
         self._register_web_apis()
 
@@ -196,6 +230,7 @@ class SwitchModelPlugin(Star):
         self._install_manager_hook()
         self._install_resolver_hook()
         self._install_patches()
+        self._install_image_observer()
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self, *args, **kwargs) -> None:
@@ -203,6 +238,13 @@ class SwitchModelPlugin(Star):
         if not self._cfg_bool("enabled", True):
             return
         self._install_patches()
+        # 首次同步：把 AstrBot 里当前选中的主模型 / 图片转述模型 / 语音模型提到列表首位
+        try:
+            self._sync_provider_lists(force=True)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[自动切换模型] 首次同步模型列表失败：%s", exc)
+        # 用户之后在 WebUI 里改模型时，后台轮询会接着同步
+        self._start_sync_task()
         if not self._patched_ready:
             self.logger.error(
                 "[自动切换模型] 加载完成后仍未找到任何 Provider 子类，插件无法生效，"
@@ -229,6 +271,151 @@ class SwitchModelPlugin(Star):
         if self._load_provider_orig is not None:
             ProviderManager.load_provider = self._load_provider_orig
             self._load_provider_orig = None
+
+    # ------------------------------------------------ 图片旁路观察（早于所有管线）
+
+    def _install_image_observer(self) -> None:
+        """旁路观察每条入站消息：只要带图就先记下来。
+
+        为什么不用 `@filter.event_message_type(ALL)`：那类 handler 会参与唤醒判定，
+        加了等于把所有群消息都变成「需要响应」。这里改在 EventBus 打日志的位置旁挂，
+        只读、不改事件、不影响唤醒，即使后续被别的插件 `stop_event()` 也照样记得住。
+        """
+        if self._image_hook_orig is not None:
+            return
+        try:
+            from astrbot.core.event_bus import EventBus
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[自动切换模型] 无法挂载图片观察器（%s），图片补挂退化为仅请求阶段。", exc)
+            return
+        original = getattr(EventBus, "_print_event", None)
+        if not callable(original):
+            self.logger.warning("[自动切换模型] EventBus._print_event 不存在，图片补挂退化为仅请求阶段。")
+            return
+
+        plugin = self
+
+        def patched_print_event(bus_self, event, conf_name):
+            try:
+                active = _ACTIVE_PLUGIN or plugin
+                active._observe_event_images(event)
+            except Exception:  # noqa: BLE001  观察失败绝不能影响主流程
+                pass
+            return original(bus_self, event, conf_name)
+
+        patched_print_event._switch_model_hook = True
+        self._image_hook_orig = original
+        EventBus._print_event = patched_print_event
+        self.logger.info(
+            "[自动切换模型] 图片观察器已挂载：入站图片会缓存 %d 秒，供下一条 @ 提问补挂。",
+            self._cfg_int("image_bridge_ttl", 120),
+        )
+
+    def _remove_image_observer(self) -> None:
+        if self._image_hook_orig is None:
+            return
+        try:
+            from astrbot.core.event_bus import EventBus
+
+            EventBus._print_event = self._image_hook_orig
+        except Exception:  # noqa: BLE001
+            pass
+        self._image_hook_orig = None
+
+    @staticmethod
+    def _image_ref(comp: Any) -> str:
+        """取一个能交给 prepare_model_image 的图片引用。"""
+        for attr in ("path", "file", "url"):
+            value = getattr(comp, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _collect_images(self, event: AstrMessageEvent) -> list[str]:
+        """从消息链里取出全部图片引用（Image 组件 + 图片类 File）。"""
+        try:
+            chain = list(getattr(event.message_obj, "message", None) or [])
+        except Exception:  # noqa: BLE001
+            return []
+        refs: list[str] = []
+        for comp in chain:
+            name = type(comp).__name__
+            if name == "Image":
+                ref = self._image_ref(comp)
+                if ref:
+                    refs.append(ref)
+            elif name == "File" and self._file_suffix(comp) in _IMAGE_EXT:
+                ref = self._image_ref(comp)
+                if ref:
+                    refs.append(ref)
+        return refs
+
+    def _observe_event_images(self, event: AstrMessageEvent) -> None:
+        """事件总线旁路：入站消息带图就缓存（同步、只读）。"""
+        if not self._cfg_bool("enabled", True):
+            return
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return
+        try:  # 机器人自己发的消息（表情包等）不算用户输入
+            if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        refs = self._collect_images(event)
+        if refs:
+            self._store_images(umo, refs)
+            self.logger.debug(
+                "[自动切换模型] 观察到 %d 张图片，已缓存待补挂（umo=%s）", len(refs), umo
+            )
+
+    # ------------------------------------------------------------ 图片缓存
+
+    def _prune_images(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        cache = getattr(self, "_image_cache", None)
+        if not cache:
+            return
+        for key, (_, expire) in list(cache.items()):
+            if expire < now:
+                cache.pop(key, None)
+
+    def _store_images(self, umo: str, refs: list[str]) -> int:
+        ttl = self._cfg_int("image_bridge_ttl", 120)
+        if ttl <= 0 or not refs:
+            return 0
+        if not isinstance(getattr(self, "_image_cache", None), dict):
+            self._image_cache = {}
+        now = time.time()
+        self._prune_images(now)
+        current, _ = self._image_cache.get(umo, ([], 0.0))
+        merged = list(dict.fromkeys(list(current) + [r for r in refs if r]))
+        # 只保留最近几张，避免连发图片把请求撑爆
+        merged = merged[-_MAX_BRIDGE_IMAGES:]
+        self._image_cache[umo] = (merged, now + ttl)
+        return len(refs)
+
+    def _peek_images(self, umo: str | None) -> list[str]:
+        if not umo:
+            return []
+        now = time.time()
+        self._prune_images(now)
+        item = (getattr(self, "_image_cache", None) or {}).get(umo)
+        if not item or item[1] < now:
+            return []
+        return list(item[0])
+
+    def _take_images(self, umo: str | None) -> list[str]:
+        """取走并清空（一次性补挂，避免后续每条消息都重复带图）。"""
+        refs = self._peek_images(umo)
+        if umo:
+            (getattr(self, "_image_cache", None) or {}).pop(umo, None)
+        return refs
+
+    def _has_cached_images(self, umo: str | None) -> bool:
+        return bool(self._peek_images(umo))
 
     # ------------------------------------------- 解析拦截（切换后立即生效）
 
@@ -284,6 +471,138 @@ class SwitchModelPlugin(Star):
         except Exception:  # noqa: BLE001
             return None
 
+    # ------------------------------------------------- AstrBot 模型设置 → 列表同步
+
+    @staticmethod
+    def _dig(cfg: Any, path: tuple[str, ...]) -> str:
+        """按路径读字符串配置，取不到返回空串。"""
+        node = cfg
+        for part in path:
+            if not isinstance(node, dict):
+                return ""
+            node = node.get(part)
+        return str(node).strip() if isinstance(node, str) else ""
+
+    def _astrbot_mode_providers(self) -> dict[str, str]:
+        """读出 AstrBot 侧三类「用户当前选的模型」。
+
+        文本 = 主对话模型；图像 = 图片转述模型；音频 = 语音识别（STT）模型。
+        读取失败一律返回空表，交给调用方静默跳过。
+        """
+        try:
+            cfg = self.context.get_config()
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(cfg, dict):
+            return {}
+        return {
+            MODE_TEXT: self._dig(
+                cfg, ("agent_runner", "config", "model", "provider_id")
+            ),
+            MODE_IMAGE: self._dig(
+                cfg, ("provider_settings", "default_image_caption_provider_id")
+            ),
+            MODE_AUDIO: self._dig(cfg, ("provider_stt_settings", "provider_id")),
+        }
+
+    def _sync_provider_lists(self, force: bool = False) -> list[str]:
+        """把用户在 AstrBot 里新选的模型提到对应列表首位。
+
+        规则：
+        - 只在列表非空时生效——空列表本就代表「跟随 AstrBot 默认」，天然就是首选；
+        - 已在首位则什么都不做，避免无意义落盘；
+        - 不在列表里就插到首位（纳入 + 置顶 + 重新排序一步完成）；
+        - 选中的不是对话模型（STT / TTS / embedding 等）时跳过并记日志。
+
+        返回被改动的配置键，方便日志排查与单测断言。
+        """
+        if not self._cfg_bool("auto_sync_provider_models", True):
+            return []
+        wanted = self._astrbot_mode_providers()
+        if not wanted:
+            return []
+
+        instances = self._chat_instances()
+        changed: list[str] = []
+
+        for mode, pid in wanted.items():
+            if not pid:
+                continue
+            if not force and self._synced_providers.get(mode) == pid:
+                continue
+            self._synced_providers[mode] = pid
+
+            key = MODE_KEYS[mode]
+            items = self._as_id_list(self.config.get(key))
+            if not items or items[0] == pid:
+                continue
+            if not self._is_chat_instance(instances.get(pid)):
+                self.logger.info(
+                    "[自动切换模型] 检测到 AstrBot 的%s模型改为 %s，"
+                    "但它不是对话模型，跳过同步到 %s。",
+                    MODE_NAMES[mode],
+                    pid,
+                    key,
+                )
+                continue
+
+            items = [item for item in items if item != pid]
+            items.insert(0, pid)
+            self.config[key] = items
+            # 用户主动选了它，解除此前因连续失败被移出的状态
+            self._self_removed.discard((pid, mode))
+            changed.append(key)
+            self.logger.info(
+                "[自动切换模型] AstrBot 的%s模型已换为 %s，同步到 %s 首位 → [%s]",
+                MODE_NAMES[mode],
+                pid,
+                key,
+                "、".join(items),
+            )
+
+        if changed:
+            self._save_config_quietly("同步 AstrBot 模型设置")
+        return changed
+
+    def _start_sync_task(self) -> None:
+        """启动后台轮询（幂等：已在跑就不重复起）。"""
+        task = self._sync_task
+        if task is not None and not getattr(task, "done", lambda: True)():
+            return
+        try:
+            self._sync_task = asyncio.create_task(self._sync_loop())
+        except RuntimeError as exc:  # 没有事件循环时不应该发生，兜底
+            self._sync_task = None
+            self.logger.warning("[自动切换模型] 启动模型同步任务失败：%s", exc)
+
+    async def _sync_loop(self) -> None:
+        try:
+            while True:
+                # 每轮重读，改配置后不用重启也能调整节奏
+                interval = max(
+                    5, min(self._cfg_int("auto_sync_interval_seconds", 20), 600)
+                )
+                await asyncio.sleep(interval)
+                try:
+                    self._sync_provider_lists()
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("[自动切换模型] 模型同步出错：%s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def _stop_sync_task(self) -> None:
+        task = self._sync_task
+        self._sync_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("[自动切换模型] 同步任务退出时抛出异常：%s", exc)
+
     def _best_available(self, mode: str = MODE_TEXT):
         candidates = self._candidates(set(), mode)
         if not candidates:
@@ -301,6 +620,18 @@ class SwitchModelPlugin(Star):
             return resolved
 
         mode = self._pending_mode(umo)
+        if (
+            mode == MODE_TEXT
+            and self._list_of(MODE_IMAGE)
+            and self._has_cached_images(umo)
+        ):
+            # 本会话有待补挂的图（QQ 的图与 @ 提问分两条发送）→ 本次必须按图像请求选模，
+            # 否则会挑到不支持 image 的模型，AstrBot 随后把图裁掉，模型只会回「图片是空的」。
+            mode = MODE_IMAGE
+            self.logger.debug(
+                "[自动切换模型] 检测到待补挂图片，本次按图像请求选模（umo=%s）", umo
+            )
+
         if mode != MODE_TEXT:
             if not self._list_of(mode):
                 # 该类型没配列表 → 不干预，保持原有解析结果
@@ -364,9 +695,12 @@ class SwitchModelPlugin(Star):
         global _ACTIVE_PLUGIN
         if _ACTIVE_PLUGIN is self:
             _ACTIVE_PLUGIN = None
+        await self._stop_sync_task()
         self._remove_patches()
         self._remove_resolver_hook()
         self._remove_manager_hook()
+        self._remove_image_observer()
+        self._image_cache.clear()
         self.logger.info("[自动切换模型] 已卸载，Provider 钩子已还原。")
 
     # ------------------------------------------------------------------ 配置读取
@@ -634,12 +968,24 @@ class SwitchModelPlugin(Star):
 
     def _remember_mode(self, umo: str | None, mode: str) -> None:
         ttl = max(5, self._cfg_int("mode_ttl", 30))
-        expire = time.time() + ttl
+        now = time.time()
+        expire = now + ttl
         if umo:
-            self._pending[umo] = (mode, expire)
+            prev = self._pending.get(umo)
+            if (
+                prev
+                and prev[1] >= now
+                and prev[0] in (MODE_IMAGE, MODE_AUDIO)
+                and mode == MODE_TEXT
+            ):
+                # QQ 不允许 @ 和图片同条发送，所以「图」和「提问」必然是两条消息。
+                # 后到的纯文本不能把还没过期的图像/音频判定盖掉，否则图就在上下文里
+                # 却按文本列表选了不支持图像的模型，AstrBot 会把图裁掉 → 模型回「图片是空的」。
+                self._pending[umo] = (prev[0], expire)
+            else:
+                self._pending[umo] = (mode, expire)
         self._pending_any = (mode, expire)
         self._last_mode = mode
-        now = time.time()
         for key, (_, exp) in list(self._pending.items()):
             if exp < now:
                 self._pending.pop(key, None)
@@ -697,6 +1043,27 @@ class SwitchModelPlugin(Star):
             return MODE_IMAGE
         return MODE_TEXT
 
+    def _should_defer_image(self, event: AstrMessageEvent) -> bool:
+        """纯图片消息是否该等用户追问，而不是立刻回一句看图感想。"""
+        if not self._cfg_bool("image_wait_followup", True):
+            return False
+        # 不缓存就别扣住消息，否则图直接丢了
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return False
+        if (getattr(event, "message_str", "") or "").strip():
+            return False
+
+        try:
+            chain = list(getattr(event.message_obj, "message", None) or [])
+        except Exception:  # noqa: BLE001
+            return False
+        for comp in chain:
+            name = type(comp).__name__
+            if name in ("Reply", "At", "AtAll"):
+                # 已经 @ 了机器人 / 引用了某条消息 → 用户就是在发起提问，正常处理
+                return False
+        return True
+
     @filter.on_waiting_llm_request()
     async def on_waiting_llm_request(self, event: AstrMessageEvent, *args, **kwargs) -> None:
         """确定要调用 LLM 时，先判定本次属于哪一类请求。"""
@@ -705,7 +1072,21 @@ class SwitchModelPlugin(Star):
         mode = self._mode_from_event(event)
         umo = getattr(event, "unified_msg_origin", None)
         self._remember_mode(umo, mode)
+
+        if mode == MODE_IMAGE and umo:
+            # 事件总线观察器可能已经存过，这里再存一次用于「观察器挂不上」的兜底（自动去重）
+            self._store_images(umo, self._collect_images(event))
+
         if mode == MODE_TEXT:
+            return
+
+        if mode == MODE_IMAGE and self._should_defer_image(event):
+            event.stop_event()
+            self.logger.info(
+                "[自动切换模型] 收到纯图片消息，已缓存 %d 张，等你追问时一起送给模型（%d 秒内有效）",
+                len(self._peek_images(umo)),
+                self._cfg_int("image_bridge_ttl", 120),
+            )
             return
 
         model_list = self._list_of(mode)
@@ -722,6 +1103,55 @@ class SwitchModelPlugin(Star):
             MODE_NAMES[mode],
             MODE_KEYS[mode],
             model_list[0],
+        )
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any = None, *args, **kwargs) -> None:
+        """请求发出前的最后一道加工：抑制正文 @、补挂先到的图片。"""
+        if req is None or not self._cfg_bool("enabled", True):
+            return
+        self._inject_no_text_mention(req)
+        self._bridge_cached_images(event, req)
+
+    def _inject_no_text_mention(self, req: Any) -> None:
+        """告诉模型别在正文里写 @——平台已经自动 @ 了，重复写会显示成多个 @。"""
+        if not self._cfg_bool("suppress_text_mention", True):
+            return
+        current = getattr(req, "system_prompt", "") or ""
+        if not isinstance(current, str):
+            return
+        if _NO_TEXT_MENTION_MARK in current:
+            return  # 工具循环里本钩子可能被多次触发，避免重复追加
+        current = current.rstrip()
+        req.system_prompt = (
+            current + "\n\n" + _NO_TEXT_MENTION_RULE if current else _NO_TEXT_MENTION_RULE
+        )
+        self.logger.debug("[自动切换模型] 已在系统提示词中追加「正文不要写 @」约束")
+
+    def _bridge_cached_images(self, event: AstrMessageEvent, req: Any) -> None:
+        """把先前缓存的图片补挂到本次请求上。
+
+        `OnLLMRequestEvent` 早于 `prepare_request_images()`，所以这里改 `req.image_urls`
+        能真正进入模型输入；晚于此再改就来不及了。
+        """
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return
+        umo = getattr(event, "unified_msg_origin", None)
+        if not self._has_cached_images(umo):
+            return
+
+        current = [str(x) for x in (getattr(req, "image_urls", None) or []) if x]
+        cached = self._take_images(umo)
+        merged = list(dict.fromkeys(current + [r for r in cached if r not in current]))
+        if len(merged) <= len(current):
+            return
+        req.image_urls = merged
+        added = len(merged) - len(current)
+        event.set_extra("_switch_model_bridged_images", added)
+        self.logger.info(
+            "[自动切换模型] 已把先前缓存的 %d 张图片补挂到本次请求（本次共 %d 张）",
+            added,
+            len(merged),
         )
 
     # ------------------------------------------------------------------ 挂钩实现
@@ -935,6 +1365,11 @@ class SwitchModelPlugin(Star):
             if self._preferred_id in ids:
                 ids.remove(self._preferred_id)
                 ids.insert(0, self._preferred_id)
+
+        # 被 remove 策略移出的模型，本次运行内不再参与候选
+        # （文本列表会自动追加未列出的模型，仅删配置挡不住它）
+        if self._self_removed:
+            ids = [pid for pid in ids if (pid, mode) not in self._self_removed]
         return ids
 
     def _candidates(self, exclude: set[str], mode: str = MODE_TEXT) -> list[tuple[str, Any]]:
@@ -955,7 +1390,7 @@ class SwitchModelPlugin(Star):
     def _in_cooldown(self, pid: str) -> bool:
         return self._cooldown_until.get(pid, 0.0) > time.time()
 
-    def _mark_failed(self, pid: str, reason: str) -> None:
+    def _mark_failed(self, pid: str, reason: str, mode: str = MODE_TEXT) -> None:
         seconds = max(0, self._cfg_int("cooldown_seconds", 180))
         self._cooldown_until[pid] = time.time() + seconds
         self._last_reason[pid] = reason[:200]
@@ -965,11 +1400,117 @@ class SwitchModelPlugin(Star):
             reason[:120] or "未知原因",
             seconds,
         )
+        self._note_failure(pid, mode)
 
-    def _mark_ok(self, pid: str) -> None:
+    def _mark_ok(self, pid: str, mode: str | None = None) -> None:
+        if mode is None:
+            for key in [item for item in self._failure_counts if item[0] == pid]:
+                self._failure_counts.pop(key, None)
+        else:
+            self._failure_counts.pop((pid, mode), None)
         if pid in self._cooldown_until:
             self._cooldown_until.pop(pid, None)
             self._last_reason.pop(pid, None)
+
+    # ------------------------------------------------------------ 失败处理策略
+
+    def _failure_policy(self) -> str:
+        """none = 只冷却（旧行为）；demote = 降到列表末尾；remove = 移出列表。"""
+        raw = str(self._cfg("failure_policy", "demote") or "").strip().lower()
+        return raw if raw in {"none", "demote", "remove"} else "demote"
+
+    def _failure_threshold(self) -> int:
+        return max(1, min(self._cfg_int("failure_threshold", 3), 20))
+
+    def _note_failure(self, pid: str, mode: str) -> None:
+        """累计连续失败次数，达到阈值后按配置的策略处理。"""
+        policy = self._failure_policy()
+        if policy == "none":
+            return
+        key = (pid, mode)
+        count = self._failure_counts.get(key, 0) + 1
+        threshold = self._failure_threshold()
+        if count < threshold:
+            self._failure_counts[key] = count
+            self.logger.info(
+                "[自动切换模型] %s 连续失败 %s/%s 次，达到阈值后执行 %s。",
+                pid,
+                count,
+                threshold,
+                policy,
+            )
+            return
+        self._failure_counts.pop(key, None)
+        self._apply_failure_policy(pid, mode, policy, count)
+
+    def _apply_failure_policy(
+        self, pid: str, mode: str, policy: str, count: int
+    ) -> None:
+        """按策略调整该模式下该模型的位置；列表为空时只保留冷却行为。"""
+        key = MODE_KEYS[mode]
+        items = self._as_id_list(self.config.get(key))
+        if not items:
+            self.logger.info(
+                "[自动切换模型] %s 连续失败 %s 次，但 %s 为空（跟随 AstrBot 默认），"
+                "仅冷却不调整顺序。",
+                pid,
+                count,
+                key,
+            )
+            return
+
+        if pid not in items:
+            # 不在列表里的模型（文本列表可能靠自动追加进来）没有顺序可调
+            if policy == "remove":
+                self._self_removed.add((pid, mode))
+                self.logger.warning(
+                    "[自动切换模型] %s 连续失败 %s 次，已在本次运行内移出%s候选。",
+                    pid,
+                    count,
+                    MODE_NAMES[mode],
+                )
+            return
+
+        if policy == "remove":
+            if len(items) <= 1:
+                self.logger.warning(
+                    "[自动切换模型] %s 连续失败 %s 次，但它是%s列表里唯一的模型，"
+                    "跳过移除以免列表变空后退回全量候选。",
+                    pid,
+                    count,
+                    MODE_NAMES[mode],
+                )
+                return
+            items = [item for item in items if item != pid]
+            self._self_removed.add((pid, mode))
+            action = f"从{MODE_NAMES[mode]}列表中移除"
+        else:
+            items = [item for item in items if item != pid]
+            items.append(pid)
+            action = f"降到{MODE_NAMES[mode]}列表末尾"
+
+        self.config[key] = items
+        saved = self._save_config_quietly("失败策略调整")
+        self.logger.warning(
+            "[自动切换模型] %s 连续失败 %s 次，已%s → [%s]%s。",
+            pid,
+            count,
+            action,
+            "、".join(items),
+            "（已落盘）" if saved else "",
+        )
+
+    def _save_config_quietly(self, action: str) -> bool:
+        """把内存配置写回磁盘；失败只记日志，不影响主流程。"""
+        save = getattr(self.config, "save_config", None)
+        if not callable(save):
+            return False
+        try:
+            save()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[自动切换模型] %s后落盘失败：%s", action, exc)
+            return False
 
     # ------------------------------------------------------------------ 切换后处理
 
@@ -979,7 +1520,7 @@ class SwitchModelPlugin(Star):
         self._switch_count += 1
         self._last_switch = (time.time(), failed_pid, new_pid, mode)
         self._current_id = new_pid
-        self._mark_ok(new_pid)
+        self._mark_ok(new_pid, mode)
 
         if mode != MODE_TEXT:
             # 图像 / 音频请求的切换只在本次生效：不写偏好、不改主模型，
@@ -1055,7 +1596,7 @@ class SwitchModelPlugin(Star):
 
         switch, fragment = self._should_switch(resp)
         if not switch:
-            self._mark_ok(pid)
+            self._mark_ok(pid, mode)
             return resp
 
         result = await self._failover(provider, pid, "text_chat", args, kwargs, fragment, mode)
@@ -1086,7 +1627,7 @@ class SwitchModelPlugin(Star):
             if produced or not switch:
                 raise
 
-        self._mark_failed(pid, fragment)
+        self._mark_failed(pid, fragment, mode)
         for cand_id, cand in self._candidates({pid}, mode):
             try:
                 cand_orig = self._original_for(cand, "text_chat_stream")
@@ -1095,7 +1636,7 @@ class SwitchModelPlugin(Star):
                 await self._on_switch_success(pid, cand_id, mode)
                 return
             except Exception as exc:  # noqa: BLE001
-                self._mark_failed(cand_id, str(exc))
+                self._mark_failed(cand_id, str(exc), mode)
                 continue
         self.logger.error("[自动切换模型] 流式请求：%s 失败且无可切换模型。", pid)
         raise
@@ -1112,7 +1653,7 @@ class SwitchModelPlugin(Star):
     ):
         """按顺序尝试候选模型，全部失败返回 None。"""
         async with self._lock:
-            self._mark_failed(pid, reason)
+            self._mark_failed(pid, reason, mode)
             candidates = self._candidates({pid}, mode)
 
             if not candidates:
@@ -1135,7 +1676,7 @@ class SwitchModelPlugin(Star):
                     self.logger.warning(
                         "[自动切换模型] 候选 %s 调用失败：%s", cand_id, str(exc)[:150]
                     )
-                    self._mark_failed(cand_id, str(exc))
+                    self._mark_failed(cand_id, str(exc), mode)
                     continue
 
                 if self._is_err_response(resp):
@@ -1144,7 +1685,7 @@ class SwitchModelPlugin(Star):
                         cand_id,
                         self._text_of(resp)[:150],
                     )
-                    self._mark_failed(cand_id, self._text_of(resp))
+                    self._mark_failed(cand_id, self._text_of(resp), mode)
                     continue
 
                 await self._on_switch_success(pid, cand_id, mode)
@@ -1211,12 +1752,22 @@ class SwitchModelPlugin(Star):
 
     def _render_status(self) -> str:
         mode = self._pending_mode()
+        policy = self._failure_policy()
+        policy_text = (
+            "只冷却，不改列表"
+            if policy == "none"
+            else f"连续 {self._failure_threshold()} 次后调整列表"
+        )
+        sync_on = self._cfg_bool("auto_sync_provider_models", True)
+        sync_interval = max(5, min(self._cfg_int("auto_sync_interval_seconds", 20), 600))
         lines = [
             f"版本：{VERSION}",
             f"启用：{'是' if self._cfg_bool('enabled', True) else '否'}",
             f"排序策略：{self._strategy()}（{STRATEGY_HELP[self._strategy()]}）",
             f"关键词：{len(self._keywords())} 条 / 模式 {self._cfg('match_mode', 'substring')}",
             f"冷却：{self._cfg_int('cooldown_seconds', 180)} 秒 / 单次最多试 {self._cfg_int('max_chain', 4)} 个",
+            f"失败策略：{policy}（{policy_text}）",
+            f"自动同步：{'开' if sync_on else '关'}（每 {sync_interval} 秒检查 AstrBot 模型设置）",
             f"持久化切换：{'开' if self._cfg_bool('persist_switch', True) else '关（仅本次运行有效）'}",
             "",
             f"文本列表：{len(self._list_of(MODE_TEXT))} 个"
