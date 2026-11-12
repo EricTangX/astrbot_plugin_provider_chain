@@ -1,4 +1,4 @@
-"""astrbot_plugin_switch_model 1.6.0 —— 文本模型报错自动切换。
+"""astrbot_plugin_switch_model 2.0.0 —— 文本模型报错自动切换。
 
 只保留文本对话模型的故障切换：
 - 按 `text_models` 的顺序挑选本次使用的模型（列表留空则跟随 AstrBot 主模型）；
@@ -8,6 +8,10 @@
 
 图像 / 音频的「模型切换」仍然不做；但保留了「先发图再 @」的图片补挂与兜底转码，
 解决 QQ 把图和文字拆成两条消息、导致追问看不到图的问题。所有设置都在插件配置表单里。
+
+2.0.0：配置表单按功能拆成「基础 / 切换规则 / 模型与同步 / 图片处理」四张卡片，
+枚举项改为下拉选择；内部路径统一由 CFG_PATHS 映射，首次加载会把 1.x 的平铺配置
+自动搬迁到分组结构（旧键保留为隐藏字段，可安全回退）。
 插件只在内存中挂钩 Provider 层，卸载 / 重载后自动还原，不修改 AstrBot 源码。
 """
 
@@ -32,13 +36,51 @@ from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.provider import Provider
 
 PLUGIN_NAME = "astrbot_plugin_switch_model"
-VERSION = "1.7.4"
+VERSION = "2.0.0"
 
-# 仅支持文本对话模型
+# 2.0 起配置按功能分成 4 张卡片（_conf_schema.json 里的 object 组），
+# 这里把「逻辑名 → 配置路径」集中一处，避免以后调整结构时又要满地改字符串。
 MODE_TEXT = "text"
 MODE_IMAGE = "image"
 MODE_NAMES = {MODE_TEXT: "文本", MODE_IMAGE: "图像"}
-MODE_KEYS = {MODE_TEXT: "text_models", MODE_IMAGE: "image_models"}
+MODE_KEYS = {MODE_TEXT: "models.text_models", MODE_IMAGE: "models.image_models"}
+MODE_PATHS = {MODE_TEXT: ("models", "text_models"), MODE_IMAGE: ("models", "image_models")}
+
+CFG_PATHS: dict[str, tuple[str, ...]] = {
+    # 基础
+    "enabled": ("basic", "enabled"),
+    "suppress_text_mention": ("basic", "suppress_text_mention"),
+    "warn_when_empty": ("basic", "warn_when_empty"),
+    # 切换规则
+    "error_keywords": ("rules", "error_keywords"),
+    "match_mode": ("rules", "match_mode"),
+    "ignore_case": ("rules", "ignore_case"),
+    "match_response_text": ("rules", "match_response_text"),
+    "max_chain": ("rules", "max_chain"),
+    "cooldown_seconds": ("rules", "cooldown_seconds"),
+    "failure_policy": ("rules", "failure_policy"),
+    "failure_threshold": ("rules", "failure_threshold"),
+    # 模型与同步
+    "text_models": ("models", "text_models"),
+    "image_models": ("models", "image_models"),
+    "strategy": ("models", "strategy"),
+    "strict_allowlist": ("models", "strict_allowlist"),
+    "auto_append_enabled": ("models", "auto_append_enabled"),
+    "auto_sync_provider_models": ("models", "auto_sync_provider_models"),
+    "auto_sync_interval_seconds": ("models", "auto_sync_interval_seconds"),
+    "persist_switch": ("models", "persist_switch"),
+    # 图片处理
+    "image_wait_followup": ("image", "image_wait_followup"),
+    "image_defer_auto_reply": ("image", "image_defer_auto_reply"),
+    "image_wait_seconds": ("image", "image_wait_seconds"),
+    "image_bridge_ttl": ("image", "image_bridge_ttl"),
+    "image_safe_transcode": ("image", "image_safe_transcode"),
+    "image_drop_thumbnails": ("image", "image_drop_thumbnails"),
+}
+
+# 1.7.x 的平铺键：schema 里仍保留（invisible），首次加载时搬到新路径，
+# 既保证升级不丢设置，也让用户能安全回退到 1.7.x。
+LEGACY_FLAT_KEYS: tuple[str, ...] = tuple(CFG_PATHS)
 
 # 图片补挂（先发图再 @）用到的常量
 _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
@@ -76,6 +118,14 @@ DEFAULT_KEYWORDS = [
 STRATEGY_HELP = {
     "order": "按列表顺序（默认，推荐）",
     "alphabetical": "按模型 ID 字典序（忽略列表顺序）",
+}
+
+# 下拉类字段的合法取值：1.x 是自由文本框，用户可能填了 "demote " 这类带空格的写法，
+# 下拉控件认不出来会显示空白，所以启动时统一规范化一次。
+ENUM_VALUES: dict[str, set[str]] = {
+    "match_mode": {"substring", "regex"},
+    "strategy": {"order", "alphabetical"},
+    "failure_policy": {"none", "demote", "remove"},
 }
 
 # 当前生效的插件实例：挂钩是类级别的，热重载后要能指向新实例
@@ -169,6 +219,10 @@ class SwitchModelPlugin(Star):
 
     async def initialize(self) -> None:
         global _ACTIVE_PLUGIN
+        # 先做配置结构迁移：必须在任何 _cfg 读取之前完成，
+        # 否则 1.x 的平铺值会被分组默认值盖住。
+        self._migrate_config_v2()
+        self._normalize_enum_values()
         if not self._cfg_bool("enabled", True):
             _ACTIVE_PLUGIN = None
             self.logger.info("[自动切换模型] 插件已禁用（enabled=false），不做任何挂钩。")
@@ -340,7 +394,8 @@ class SwitchModelPlugin(Star):
             self._synced_providers[mode] = pid
 
             key = MODE_KEYS[mode]
-            items = self._as_id_list(self.config.get(key))
+            path = MODE_PATHS[mode]
+            items = self._as_id_list(self._get_path(path))
             if not items or items[0] == pid:
                 continue
             if strict and pid not in items:
@@ -366,7 +421,7 @@ class SwitchModelPlugin(Star):
 
             items = [item for item in items if item != pid]
             items.insert(0, pid)
-            self.config[key] = items
+            self._set_path(path, items)
             # 用户主动选了它，解除此前因连续失败被移出的状态
             self._self_removed.discard((pid, mode))
             changed.append(key)
@@ -574,24 +629,106 @@ class SwitchModelPlugin(Star):
 
     # ------------------------------------------------------------------ 配置读取
 
+    def _get_path(self, path: tuple[str, ...], default: Any = None) -> Any:
+        """按分组路径读值，缺任何一层都返回 default。"""
+        node: Any = self.config
+        for part in path:
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return default if node is None else node
+
+    def _set_path(self, path: tuple[str, ...], value: Any) -> None:
+        """按分组路径写值，中间层缺失时自动补空字典。"""
+        node: Any = self.config
+        for part in path[:-1]:
+            nxt = node.get(part) if isinstance(node, dict) else None
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[part] = nxt
+            node = nxt
+        node[path[-1]] = value
+
     def _cfg(self, key: str, default: Any = None) -> Any:
-        value = self.config.get(key, default)
+        """读配置：优先分组路径，回退 1.x 平铺键（未迁移或用户降级时仍可用）。"""
+        path = CFG_PATHS.get(key)
+        value = self._get_path(path, None) if path else None
+        if value is None:
+            value = self.config.get(key, None)
         return default if value is None else value
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
-        value = self.config.get(key, default)
+        value = self._cfg(key, default)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on", "是"}
         return bool(value)
 
     def _cfg_int(self, key: str, default: int) -> int:
         try:
-            return int(self.config.get(key, default))
+            return int(self._cfg(key, default))
         except (TypeError, ValueError):
             return default
 
+    def _normalize_enum_values(self) -> None:
+        """把下拉字段的取值改成标准写法（去空格、转小写）。
+
+        1.x 用文本框时可能存成 "demote "、"Order" 这类形式，运行期虽然能容错，
+        但下拉控件匹配不到选项会显示空白。这里统一收敛，只在不一致时落盘。
+        """
+        fixed: list[str] = []
+        for key, allowed in ENUM_VALUES.items():
+            raw = self._cfg(key, None)
+            if not isinstance(raw, str):
+                continue
+            value = raw.strip().lower()
+            if value not in allowed or value == raw:
+                continue
+            self._set_path(CFG_PATHS[key], value)
+            fixed.append("%s: %r → %r" % (key, raw, value))
+
+        if not fixed:
+            return
+        self._save_config_quietly("枚举值规范化")
+        self.logger.info(
+            "[自动切换模型] 已规范化下拉字段取值：%s", "；".join(fixed)
+        )
+
+    def _migrate_config_v2(self) -> None:
+        """把 1.x 的平铺配置搬进 2.0 的分组结构，只跑一次。
+
+        AstrBot 在构造 AstrBotConfig 时会删掉 schema 里没有的键，所以旧键
+        以 `invisible` 的形式保留在 schema 里；这里把它们逐项复制到新路径，
+        并打上 `_migrated_v2` 标记，之后用户在新表单里的修改不会被覆盖。
+        """
+        if self._get_path(("_migrated_v2",), False):
+            return
+
+        # 先保证四个分组容器存在：后面无论是否有旧值，写入都不会踩空。
+        for group in ("basic", "rules", "models", "image"):
+            if not isinstance(self.config.get(group), dict):
+                self.config[group] = {}
+
+        moved: list[str] = []
+        for key in LEGACY_FLAT_KEYS:
+            if key not in self.config:
+                continue
+            legacy = self.config.get(key)
+            if legacy is None:
+                continue
+            path = CFG_PATHS[key]
+            self._set_path(path, legacy)
+            moved.append(key)
+
+        self._set_path(("_migrated_v2",), True)
+        saved = self._save_config_quietly("v2 配置迁移")
+        self.logger.info(
+            "[自动切换模型] 配置结构升级到 2.0：已迁移 %d 项到分组结构%s。",
+            len(moved),
+            "（已落盘）" if saved else "（仅内存，配置对象不支持落盘）",
+        )
+
     def _keywords(self) -> list[str]:
-        raw = self.config.get("error_keywords")
+        raw = self._cfg("error_keywords")
         if isinstance(raw, str):
             raw = [line for line in re.split(r"[\n,，;；]", raw)]
         if not isinstance(raw, list) or not raw:
@@ -617,8 +754,8 @@ class SwitchModelPlugin(Star):
     def _list_of(self, mode: str = MODE_TEXT) -> list[str]:
         """取某一类模型的优先级列表（文本 / 图像）。"""
         if mode == MODE_IMAGE:
-            return self._as_id_list(self.config.get("image_models"))
-        items = self._as_id_list(self.config.get("text_models"))
+            return self._as_id_list(self._cfg("image_models"))
+        items = self._as_id_list(self._cfg("text_models"))
         if not items:
             # 兼容 1.0.0 的配置：老的 models 列表就是文本列表
             items = self._as_id_list(self.config.get("models"))
@@ -908,7 +1045,8 @@ class SwitchModelPlugin(Star):
             else:
                 ids = sorted(self._chat_instances())
         else:
-            # 图像 / 音频列表严格按手写顺序，不自动追加：能力未知，不敢替你猜
+            # 图像列表同样「列表顺序即优先级」（表单里可勾选、可用 ↑↓ 排序），
+            # 只是不自动追加未列出的模型：视觉能力无法从配置判断，猜错会让请求直接失败。
             ids = list(declared)
 
         if self._strategy() == "alphabetical":
@@ -1002,7 +1140,8 @@ class SwitchModelPlugin(Star):
     ) -> None:
         """按策略调整该模式下该模型的位置；列表为空时只保留冷却行为。"""
         key = MODE_KEYS[mode]
-        items = self._as_id_list(self.config.get(key))
+        path = MODE_PATHS[mode]
+        items = self._as_id_list(self._get_path(path))
         if not items:
             self.logger.info(
                 "[自动切换模型] %s 连续失败 %s 次，但 %s 为空（跟随 AstrBot 默认），"
@@ -1043,7 +1182,7 @@ class SwitchModelPlugin(Star):
             items.append(pid)
             action = f"降到{MODE_NAMES[mode]}列表末尾"
 
-        self.config[key] = items
+        self._set_path(path, items)
         saved = self._save_config_quietly("失败策略调整")
         self.logger.warning(
             "[自动切换模型] %s 连续失败 %s 次，已%s → [%s]%s。",
@@ -1571,7 +1710,7 @@ class SwitchModelPlugin(Star):
         补挂有效期影响「发图后多久内追问还能把图带上」，两者诉求不同。
         未配置时退回旧行为（沿用 image_bridge_ttl）。
         """
-        raw = self.config.get("image_wait_seconds")
+        raw = self._cfg("image_wait_seconds", None)
         if raw is None or str(raw).strip() == "":
             return max(0, min(self._cfg_int("image_bridge_ttl", 120), 600))
         return max(0, min(self._cfg_int("image_wait_seconds", 10), 600))
@@ -2000,7 +2139,7 @@ class SwitchModelPlugin(Star):
             self._preferred_id = None
             yield event.plain_result("已清空全部冷却状态与运行时偏好，主模型回到配置值。")
         elif sub in ("on", "off"):
-            self.config["enabled"] = sub == "on"
+            self._set_path(CFG_PATHS["enabled"], sub == "on")
             yield event.plain_result(
                 f"插件已临时{'启用' if sub == 'on' else '停用'}"
                 f"（运行时开关，重启后以配置文件为准）。"

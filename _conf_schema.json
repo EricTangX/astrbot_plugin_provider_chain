@@ -1,174 +1,413 @@
 {
-    "enabled": {
-        "description": "启用插件",
+    "basic": {
+        "description": "基础",
+        "hint": "总开关、回复格式与日志",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "启用插件",
+                "type": "bool",
+                "hint": "关闭后不再挂钩任何 Provider 调用，等同卸载；已配置的列表不会丢失。",
+                "default": true
+            },
+            "suppress_text_mention": {
+                "description": "抑制回复正文里的 @",
+                "type": "bool",
+                "hint": "AstrBot 会按平台设置自动 @ 提问者；开启后额外要求模型不要在人名前后再写 @，避免显示成 2~3 个重复的 @。",
+                "default": true
+            },
+            "warn_when_empty": {
+                "description": "无候选时输出错误日志",
+                "type": "bool",
+                "hint": "全部候选都在冷却、或列表为空时打一条 ERROR，便于事后排查；关掉则完全静默。",
+                "default": true
+            }
+        }
+    },
+    "rules": {
+        "description": "切换规则",
+        "hint": "什么算失败、失败后试几次、怎么处理",
+        "type": "object",
+        "items": {
+            "error_keywords": {
+                "description": "触发切换的错误关键词",
+                "type": "list",
+                "hint": "命中任意一条即切换。「子串包含」模式下为包含即命中；「正则表达式」模式下每条按正则解析。",
+                "default": [
+                    "Free quota exhausted",
+                    "AllocationQuota.FreeTierOnly",
+                    "insufficient_quota",
+                    "insufficient balance",
+                    "quota",
+                    "rate limit",
+                    "RateLimitError",
+                    "invalid_api_key",
+                    "InvalidApiKey",
+                    "model_not_found",
+                    "All chat models failed",
+                    "service unavailable",
+                    "timed out",
+                    "APITimeoutError",
+                    "ReadTimeout",
+                    "Error code:",
+                    "HTTP 4",
+                    "HTTP 5"
+                ]
+            },
+            "match_mode": {
+                "description": "关键词匹配方式",
+                "type": "string",
+                "options": [
+                    "substring",
+                    "regex"
+                ],
+                "labels": [
+                    "子串包含（推荐）",
+                    "正则表达式"
+                ],
+                "hint": "绝大多数情况用子串包含即可；只有在需要「A 且 B」「排除某类错误」时才换正则。",
+                "default": "substring"
+            },
+            "ignore_case": {
+                "description": "忽略大小写",
+                "type": "bool",
+                "hint": "开启后 RATE LIMIT 也能命中 rate limit；只有关键词区分大小写时才需要关。",
+                "default": true
+            },
+            "match_response_text": {
+                "description": "同时检查返回内容",
+                "type": "bool",
+                "hint": "有些 Provider 不抛异常，而是返回 role=err 或一段错误文本；开启后这类返回也会触发切换。",
+                "default": true
+            },
+            "max_chain": {
+                "description": "单次最多尝试的候选数",
+                "type": "int",
+                "hint": "一次报错最多连续换几个模型，防止长时间卡住。建议 2~4。",
+                "default": 4
+            },
+            "cooldown_seconds": {
+                "description": "失败模型冷却时长（秒）",
+                "type": "int",
+                "hint": "判定失败的模型在这段时间内不再作为候选，避免反复撞同一个额度耗尽的模型；到期自动恢复。",
+                "default": 180
+            },
+            "failure_policy": {
+                "description": "连续失败后的处理策略",
+                "type": "string",
+                "options": [
+                    "none",
+                    "demote",
+                    "remove"
+                ],
+                "labels": [
+                    "只冷却，不改列表",
+                    "降到列表末尾（推荐）",
+                    "移出本轮候选"
+                ],
+                "hint": "同一模型在同一类请求里连续失败达阈值后执行。「只冷却」最保守；「移出」在重启后恢复。",
+                "default": "demote"
+            },
+            "failure_threshold": {
+                "description": "触发处理策略的连续失败次数",
+                "type": "int",
+                "hint": "只统计连续失败：中间成功一次就清零重计。范围 1~20。",
+                "default": 3
+            }
+        }
+    },
+    "models": {
+        "description": "模型与同步",
+        "hint": "两张优先级列表、取用顺序与自动同步",
+        "type": "object",
+        "items": {
+            "text_models": {
+                "description": "文本模型优先级（有序，留空则跟随 AstrBot 主模型）",
+                "type": "list",
+                "_special": "select_providers",
+                "hint": "点下方输入框从已启用模型里勾选，选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级：第一名是首选，报错后依次往后。留空 = 沿用 WebUI 里设置的主模型。",
+                "default": []
+            },
+            "image_models": {
+                "description": "图像模型优先级（有序，留空则不做图像路由）",
+                "type": "list",
+                "_special": "select_providers",
+                "hint": "带图片的请求（含「先发图再 @」补挂进来的图）按这个列表选模，必须放支持看图的模型。选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级；留空则不做图像路由。",
+                "default": [
+                    "qwen3.8-omni-flash"
+                ]
+            },
+            "strategy": {
+                "description": "列表排序策略",
+                "type": "string",
+                "options": [
+                    "order",
+                    "alphabetical"
+                ],
+                "labels": [
+                    "按列表顺序（推荐）",
+                    "按模型 ID 字典序"
+                ],
+                "hint": "决定两张列表怎么取用：按列表顺序 = 完全尊重你排的优先级；按字典序 = 忽略排序，只按模型 ID 升序。",
+                "default": "order"
+            },
+            "strict_allowlist": {
+                "description": "严格候选集（只调用列表内模型）",
+                "type": "bool",
+                "hint": "开启且某类列表非空时，运行期只会调用该列表内的模型：不自动追加、候选全冷却也不退回主模型、主模型变更也不越界。列表内一个可用模型都没有时报错，而不是偷偷换别家。",
+                "default": true
+            },
+            "auto_append_enabled": {
+                "description": "文本列表未列出的模型自动追加",
+                "type": "bool",
+                "hint": "仅对 text_models 生效，且必须关闭严格候选集：开启后不在列表里的已启用对话模型会按 ID 排序追加到队尾。",
+                "default": false
+            },
+            "auto_sync_provider_models": {
+                "description": "自动同步 AstrBot 选中的模型到列表首位",
+                "type": "bool",
+                "hint": "在「模型提供商」里改了主对话模型时，插件自动把它提到 text_models 首位（不在列表就新增），省去手动回来添加。列表为空时不处理。",
+                "default": true
+            },
+            "auto_sync_interval_seconds": {
+                "description": "同步检查间隔（秒）",
+                "type": "int",
+                "hint": "每隔多少秒检查一次主模型有没有被改动，范围 5~600。改小更及时，但会增加配置读取频率。",
+                "default": 20
+            },
+            "persist_switch": {
+                "description": "持久化切换结果",
+                "type": "bool",
+                "hint": "开启后会把新模型写进 cmd_config.json，重启依然生效；关闭则只在本次运行内生效。图像请求的切换始终只作用于本次。",
+                "default": true
+            }
+        }
+    },
+    "image": {
+        "description": "图片处理",
+        "hint": "先发图再 @ 的补挂、等待与兜底转码",
+        "type": "object",
+        "items": {
+            "image_wait_followup": {
+                "description": "纯图片消息先不回复，等你追问",
+                "type": "bool",
+                "hint": "QQ 不允许 @ 和图片同条发送，通常先发图再打字。开启后纯图片消息先静默，等你追问时把图一起送给模型。",
+                "default": true
+            },
+            "image_defer_auto_reply": {
+                "description": "等不到追问时仍然回复",
+                "type": "bool",
+                "hint": "关闭则纯图片消息一直等你追问；开启则超过等待时长后自己看图回答。",
+                "default": true
+            },
+            "image_wait_seconds": {
+                "description": "纯图片等待追问的时长（秒）",
+                "type": "int",
+                "hint": "超过这个时间没等到追问就自己回复，填 0 表示不等待。建议 10~20 秒：太短会先回一次、追问再回一次。",
+                "default": 10
+            },
+            "image_bridge_ttl": {
+                "description": "缓存图片的有效期（秒）",
+                "type": "int",
+                "hint": "发图后多久内追问还能把图带上，设 0 表示关闭图片补挂。",
+                "default": 120
+            },
+            "image_safe_transcode": {
+                "description": "图片兜底转码",
+                "type": "bool",
+                "hint": "AstrBot 解不开截断动图或超大图时会把整张图丢掉。开启后插件自己解码一次（动图取首帧、容忍截断、失败回退 URL 重下）。只在遇到「看不到图」时打开。",
+                "default": false
+            },
+            "image_drop_thumbnails": {
+                "description": "丢弃同条消息里的缩略图",
+                "type": "bool",
+                "hint": "QQ 常把原图和预览图一起上报，丢弃面积不足一半的缩略图可省 token。仅在开启兜底转码时生效。",
+                "default": true
+            }
+        }
+    },
+    "_migrated_v2": {
+        "description": "配置结构已升级到 2.0",
         "type": "bool",
-        "hint": "关闭后不再挂钩任何 Provider 调用，等同卸载。",
+        "invisible": true,
+        "hint": "内部标记：1.x 的平铺配置是否已搬迁到分组结构。请勿手动修改。",
+        "default": false
+    },
+    "enabled": {
+        "description": "启用插件（1.x 旧字段）",
+        "type": "bool",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "error_keywords": {
-        "description": "触发切换的错误关键词",
+        "description": "触发切换的错误关键词（1.x 旧字段）",
         "type": "list",
-        "hint": "命中任意一条即触发切换。substring 模式下为「包含即命中」；regex 模式下每条按正则解析。",
-        "default": [
-            "Free quota exhausted",
-            "AllocationQuota.FreeTierOnly",
-            "insufficient_quota",
-            "insufficient balance",
-            "quota",
-            "rate limit",
-            "RateLimitError",
-            "429",
-            "403",
-            "401",
-            "402",
-            "invalid_api_key",
-            "InvalidApiKey",
-            "model_not_found",
-            "All chat models failed",
-            "service unavailable",
-            "502",
-            "503"
-        ]
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
+        "default": []
     },
     "match_mode": {
-        "description": "关键词匹配方式",
+        "description": "关键词匹配方式（1.x 旧字段）",
         "type": "string",
-        "hint": "substring = 子串包含；regex = 正则表达式。选项：substring / regex",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": "substring"
     },
     "ignore_case": {
-        "description": "忽略大小写",
+        "description": "忽略大小写（1.x 旧字段）",
         "type": "bool",
-        "hint": "开启后 403 也能匹配 free quota 之类的英文关键词。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "match_response_text": {
-        "description": "同时检查返回内容",
+        "description": "同时检查返回内容（1.x 旧字段）",
         "type": "bool",
-        "hint": "有些 Provider 不抛异常，而是返回 role=err 的响应文本。开启后会对文本再做一次关键词判定。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "strategy": {
-        "description": "列表排序策略",
+        "description": "列表排序策略（1.x 旧字段）",
         "type": "string",
-        "hint": "order = 按下面三份列表的顺序（推荐）；alphabetical = 忽略列表顺序，按模型 ID 字典序。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": "order"
     },
     "strict_allowlist": {
-        "description": "严格候选集（只调用列表内模型）",
+        "description": "严格候选集（1.x 旧字段）",
         "type": "bool",
-        "hint": "开启且某类列表非空时，运行期只会调用该列表内的模型：不再自动追加未列出的模型、候选全冷却也不退回 AstrBot 主模型、主模型变更也不会越界；列表内一个可用模型都没有时报错而不是偷偷换用别家模型。关闭 = 允许回退到列表外（旧行为）。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "text_models": {
-        "description": "文本模型优先级（有序，留空则跟随 AstrBot 主模型）",
+        "description": "文本模型优先级（1.x 旧字段）",
         "type": "list",
-        "_special": "select_providers",
-        "hint": "点下方输入框从已启用模型里勾选，选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级：第一名是首选，报错后依次往后。留空 = 沿用 WebUI 里设置的主模型；一旦勾了列表，文本请求就以第一项为准。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": []
     },
     "image_wait_followup": {
+        "description": "纯图片消息先不回复（1.x 旧字段）",
         "type": "bool",
-        "description": "纯图片消息先不回复，等你追问",
-        "hint": "QQ 不允许 @ 和图片同时发，通常先发图、再打字提问。开启后纯图片消息先静默，等你追问时把图一起送给模型。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "image_defer_auto_reply": {
+        "description": "等不到追问时仍然回复（1.x 旧字段）",
         "type": "bool",
-        "description": "等不到追问时仍然回复",
-        "hint": "关闭则纯图片消息一直等你追问；开启则超过等待时长后自己看图回答。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "image_wait_seconds": {
+        "description": "纯图片等待追问的时长（1.x 旧字段）",
         "type": "int",
-        "description": "纯图片等待追问的时长（秒）",
-        "hint": "超过这个时间没等到追问就自己回复。填 0 表示不等待。建议 10-20 秒：太短会导致图片消息先回一次、追问再回一次。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 10
     },
     "image_bridge_ttl": {
+        "description": "缓存图片的有效期（1.x 旧字段）",
         "type": "int",
-        "description": "缓存图片的有效期（秒）",
-        "hint": "发图后多久内追问还能把图带上。设 0 表示关闭图片补挂。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 120
     },
     "image_models": {
+        "description": "图像模型优先级（1.x 旧字段）",
         "type": "list",
-        "description": "图像模型优先级（有序）",
-        "hint": "带图片的请求（含「先发图再 @」补挂进来的图）按这个列表选模，必须放支持看图的模型。留空则不做图像路由，图片会被文本模型丢弃。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": [
             "qwen3.8-omni-flash"
         ]
     },
     "image_safe_transcode": {
+        "description": "图片兜底转码（1.x 旧字段）",
         "type": "bool",
-        "description": "图片兜底转码（默认关闭）",
-        "hint": "AstrBot 解不开截断动图/超大图时会把整张图丢掉。开启后插件自己解码一次（动图取首帧、容忍截断、失败回退 URL 重下）。只在遇到「看不到图」时打开。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": false
     },
     "image_drop_thumbnails": {
+        "description": "丢弃缩略图（1.x 旧字段）",
         "type": "bool",
-        "description": "丢弃同条消息里的缩略图",
-        "hint": "QQ 常把原图和预览图一起上报，丢弃面积不足一半的缩略图可省 token。仅在开启兜底转码时生效。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "suppress_text_mention": {
-        "description": "抑制回复正文里的 @",
+        "description": "抑制回复正文里的 @（1.x 旧字段）",
         "type": "bool",
-        "hint": "AstrBot 会按「回复时 @ 发送者」自动加一个 @，而模型从上下文里学会了在正文开头再写「@昵称(QQ号)」，两处叠加就会显示成 2~3 个重复的 @。开启后会在系统提示词里加一句约束，让模型不要在正文写 @（需要提到某人时直接说名字）。关闭则维持原状。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "auto_sync_provider_models": {
-        "description": "自动同步 AstrBot 里选中的模型到列表首位",
+        "description": "自动同步模型到列表首位（1.x 旧字段）",
         "type": "bool",
-        "hint": "开启后，当你在「模型提供商」里修改主对话模型、图片转述模型或语音识别模型时，插件会自动把它提到对应列表的首位（已在列表里就上移，不在就新增），不用再手动回来添加。列表为空时不处理——空列表本来就代表「跟随 AstrBot 默认」。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "auto_sync_interval_seconds": {
-        "description": "模型设置同步的检查间隔（秒）",
+        "description": "同步检查间隔（1.x 旧字段）",
         "type": "int",
-        "hint": "插件每隔多少秒检查一次上述三处设置有没有被改动。默认 20 秒，范围 5~600。改小更及时，但会略微增加配置读取频率。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 20
     },
     "auto_append_enabled": {
-        "description": "文本列表未列出的模型自动追加",
+        "description": "自动追加未列出的模型（1.x 旧字段）",
         "type": "bool",
-        "hint": "仅对 text_models 生效，且严格候选集关闭时才起作用：开启后不在列表里的已启用对话模型会按 ID 排序追加到队尾。严格候选集开启时不追加，避免出现「列表外的模型被调用」。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": false
     },
     "max_chain": {
-        "description": "单次最多尝试的候选数",
+        "description": "单次最多尝试的候选数（1.x 旧字段）",
         "type": "int",
-        "hint": "一次报错最多连续尝试几个模型，防止长时间卡住。建议 2~4。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 4
     },
     "cooldown_seconds": {
-        "description": "失败模型冷却时长（秒）",
+        "description": "失败模型冷却时长（1.x 旧字段）",
         "type": "int",
-        "hint": "判定失败的模型在此时间内不再作为候选，冷却结束自动恢复，避免反复撞同一个额度耗尽的模型。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 180
     },
     "failure_policy": {
-        "description": "模型连续失败后的处理策略",
+        "description": "连续失败后的处理策略（1.x 旧字段）",
         "type": "string",
-        "hint": "同一模型在同一类请求里连续失败达到阈值后执行：none = 只做冷却（保持旧行为）；demote = 降到该列表末尾，仍然参与切换但排最后；remove = 从列表移除，并在本次运行内不再选它（重启后恢复）。默认 demote。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": "demote"
     },
     "failure_threshold": {
-        "description": "触发处理策略的连续失败次数",
+        "description": "触发处理策略的失败次数（1.x 旧字段）",
         "type": "int",
-        "hint": "默认 3，范围 1~20。只统计「连续」失败：中间成功一次就清零，重新计数。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": 3
     },
     "persist_switch": {
-        "description": "持久化切换结果",
+        "description": "持久化切换结果（1.x 旧字段）",
         "type": "bool",
-        "hint": "开启后会改写 cmd_config.json 里的 agent_runner.config.model.provider_id，使重启后依然生效；关闭则只在本次运行内生效。图像/音频请求的切换不受此项影响，始终只作用于本次。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     },
     "warn_when_empty": {
-        "description": "无候选时输出错误日志",
+        "description": "无候选时输出错误日志（1.x 旧字段）",
         "type": "bool",
-        "hint": "所有候选都在冷却或未配置时，是否打一条 ERROR 日志便于排查。",
+        "invisible": true,
+        "hint": "仅用于从 1.x 自动迁移，请勿修改。",
         "default": true
     }
 }

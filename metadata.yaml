@@ -1,8 +1,8 @@
 name: astrbot_plugin_switch_model
 display_name: 自动切换模型
-desc: "文本模型调用报错（额度耗尽、限流、鉴权失效、模型下线等）时，按你配置的顺序自动切换到下一个可用模型。候选顺序即 text_models 列表顺序；失败模型进入冷却期，冷却结束自动恢复。支持严格候选集、连续失败策略与切换结果落盘，可抑制回复正文里重复的 @。并保留「先发图再 @」的图片补挂：QQ 把图和文字拆成两条消息时，追问也能带上前面那张图；兜底转码为可选项，默认关闭。"
-short_desc: "文本模型报错自动切换；支持先发图再 @ 的图片补挂与可选兜底转码"
-version: 1.7.4
+desc: "文本模型调用报错（额度耗尽、限流、鉴权失效、模型下线等）时，按你配置的顺序自动切换到下一个可用模型。"
+short_desc: "文本模型报错自动切换；设置按四组卡片分区，图像/文本列表均可排序"
+version: 2.0.0
 author: EricTangX
 repo: https://github.com/EricTangX/astrbot_plugin_switch_model
 astrbot_version: ">=4.0.0"
