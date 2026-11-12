@@ -67,6 +67,50 @@
         "hint": "点下方输入框从已启用模型里勾选，选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级：第一名是首选，报错后依次往后。留空 = 沿用 WebUI 里设置的主模型；一旦勾了列表，文本请求就以第一项为准。",
         "default": []
     },
+    "image_wait_followup": {
+        "type": "bool",
+        "description": "纯图片消息先不回复，等你追问",
+        "hint": "QQ 不允许 @ 和图片同时发，通常先发图、再打字提问。开启后纯图片消息先静默，等你追问时把图一起送给模型。",
+        "default": true
+    },
+    "image_defer_auto_reply": {
+        "type": "bool",
+        "description": "等不到追问时仍然回复",
+        "hint": "关闭则纯图片消息一直等你追问；开启则超过等待时长后自己看图回答。",
+        "default": true
+    },
+    "image_wait_seconds": {
+        "type": "int",
+        "description": "纯图片等待追问的时长（秒）",
+        "hint": "超过这个时间没等到追问就自己回复。填 0 表示不等待。建议 10-20 秒：太短会导致图片消息先回一次、追问再回一次。",
+        "default": 10
+    },
+    "image_bridge_ttl": {
+        "type": "int",
+        "description": "缓存图片的有效期（秒）",
+        "hint": "发图后多久内追问还能把图带上。设 0 表示关闭图片补挂。",
+        "default": 120
+    },
+    "image_models": {
+        "type": "list",
+        "description": "图像模型优先级（有序）",
+        "hint": "带图片的请求（含「先发图再 @」补挂进来的图）按这个列表选模，必须放支持看图的模型。留空则不做图像路由，图片会被文本模型丢弃。",
+        "default": [
+            "qwen3.8-omni-flash"
+        ]
+    },
+    "image_safe_transcode": {
+        "type": "bool",
+        "description": "图片兜底转码（默认关闭）",
+        "hint": "AstrBot 解不开截断动图/超大图时会把整张图丢掉。开启后插件自己解码一次（动图取首帧、容忍截断、失败回退 URL 重下）。只在遇到「看不到图」时打开。",
+        "default": false
+    },
+    "image_drop_thumbnails": {
+        "type": "bool",
+        "description": "丢弃同条消息里的缩略图",
+        "hint": "QQ 常把原图和预览图一起上报，丢弃面积不足一半的缩略图可省 token。仅在开启兜底转码时生效。",
+        "default": true
+    },
     "suppress_text_mention": {
         "description": "抑制回复正文里的 @",
         "type": "bool",

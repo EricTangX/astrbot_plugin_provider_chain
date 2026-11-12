@@ -6,16 +6,23 @@
 - 失败模型进入冷却期，冷却结束自动恢复候选资格；
 - 切换成功后立即生效，可选落盘到 `agent_runner.config.model.provider_id`。
 
-图像 / 音频的切换、图片补挂、可视化配置页均已移除，所有设置都在插件配置表单里。
+图像 / 音频的「模型切换」仍然不做；但保留了「先发图再 @」的图片补挂与兜底转码，
+解决 QQ 把图和文字拆成两条消息、导致追问看不到图的问题。所有设置都在插件配置表单里。
 插件只在内存中挂钩 Provider 层，卸载 / 重载后自动还原，不修改 AstrBot 源码。
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import io
 import json
+import os
 import re
+import threading
 import time
+import urllib.parse
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -25,14 +32,26 @@ from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.provider import Provider
 
 PLUGIN_NAME = "astrbot_plugin_switch_model"
-VERSION = "1.6.0"
+VERSION = "1.7.4"
 
 # 仅支持文本对话模型
 MODE_TEXT = "text"
-MODE_NAMES = {MODE_TEXT: "文本"}
-MODE_KEYS = {MODE_TEXT: "text_models"}
+MODE_IMAGE = "image"
+MODE_NAMES = {MODE_TEXT: "文本", MODE_IMAGE: "图像"}
+MODE_KEYS = {MODE_TEXT: "text_models", MODE_IMAGE: "image_models"}
+
+# 图片补挂（先发图再 @）用到的常量
+_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
+_MAX_BRIDGE_IMAGES = 3
+_MAX_SAFE_IMAGE_BYTES = 16 * 1024 * 1024
+_PIL_TRUNCATE_LOCK = threading.Lock()
 
 # 默认关键词：覆盖额度耗尽、限流、鉴权、余额不足、模型不存在等常见错误
+# 这些 HTTP 状态码在异常里直接判定为可切换，不写进关键词表。
+# 裸数字（401/403/429…）不能再作为子串关键词：正常回复的 repr 里含有
+# token 数、请求 ID、时间戳，随便凑出一个 403 就会误判。
+_HTTP_ERROR_CODES = frozenset({401, 402, 403, 408, 429, 500, 502, 503, 504})
+
 DEFAULT_KEYWORDS = [
     "Free quota exhausted",
     "AllocationQuota.FreeTierOnly",
@@ -41,17 +60,17 @@ DEFAULT_KEYWORDS = [
     "quota",
     "rate limit",
     "RateLimitError",
-    "429",
-    "403",
-    "401",
-    "402",
     "invalid_api_key",
     "InvalidApiKey",
     "model_not_found",
     "All chat models failed",
     "service unavailable",
-    "502",
-    "503",
+    "timed out",
+    "APITimeoutError",
+    "ReadTimeout",
+    "Error code:",
+    "HTTP 4",
+    "HTTP 5",
 ]
 
 STRATEGY_HELP = {
@@ -123,6 +142,23 @@ class SwitchModelPlugin(Star):
         self._resolve_async_orig: Any = None
         self._resolve_sync_orig: Any = None
 
+        # 图片补挂：umo -> (图片引用列表, 过期时间戳)
+        self._image_cache: dict[str, tuple[list[str], float]] = {}
+        # 本次请求是否带图：umo -> 过期时间戳（解析阶段据此选视觉模型）
+        self._image_mode_until: dict[str, float] = {}
+        # 拿不到 umo 时的兜底时间戳
+        self._image_mode_global: float = 0.0
+        # umo -> 最后一次采集过的 message_id：同一条消息只采一次，
+        # 否则「事件总线观察器（拿到 CDN URL）」和「on_waiting（拿到本地文件名）」
+        # 会把同一张图存成两个不同引用。
+        self._image_msg_id: dict[str, str] = {}
+        # 纯图片等待追问令牌：umo -> 本轮等待的令牌号
+        self._defer_tokens: dict[str, int] = {}
+        # 兜底转码结果缓存：引用键 -> (本地 PNG 路径, 过期时间戳)
+        self._safe_image_cache: dict[str, tuple[str, float]] = {}
+        # EventBus._print_event 的原始实现（旁路观察入站图片）
+        self._image_hook_orig: Any = None
+
         # 「text_models 首行覆盖了 WebUI 主模型」只提示一次，避免刷屏
         self._text_override_warned = False
 
@@ -143,6 +179,7 @@ class SwitchModelPlugin(Star):
         self._install_manager_hook()
         self._install_resolver_hook()
         self._install_patches()
+        self._install_image_observer()
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self, *args, **kwargs) -> None:
@@ -422,10 +459,49 @@ class SwitchModelPlugin(Star):
         allowed = self._allowed_ids(mode)
         return not allowed or pid in allowed
 
+    def _mark_image_request(self, umo: str) -> None:
+        """登记「本会话这次请求带图」，解析阶段据此改走视觉模型。
+
+        为什么要单独记：AstrBot 的图片转述只处理**当前事件里**的图，插件补挂的图
+        发生在转述之后，永远不会被转述；只有把请求真正交给支持 image 的模型，
+        这些图才会被看到。
+        """
+        ttl = max(30, self._cfg_int("image_bridge_ttl", 120))
+        until = time.time() + ttl
+        self._image_mode_until[umo] = until
+        self._image_mode_global = until
+
+    def _is_image_request(self, umo: str | None = None) -> bool:
+        """本会话这次请求是否带图。
+
+        有 umo 时只认本会话的登记：全局时间戳只作为「拿不到 umo」时的兜底，
+        否则一次发图会让之后两分钟内**所有会话**的文本请求都跑去视觉模型。
+        """
+        now = time.time()
+        if umo:
+            return self._image_mode_until.get(umo, 0.0) > now
+        return self._image_mode_global > now
+
     def _apply_preferred(self, provider_type, resolved, umo: str | None = None):
-        """解析拦截：让本轮选定的文本模型立即生效，无需保存或重启。"""
+        """解析拦截：带图请求走视觉模型，其余按文本列表选模。"""
         value = getattr(provider_type, "value", str(provider_type))
         if value != ProviderType.CHAT_COMPLETION.value:
+            return resolved
+
+        if self._is_image_request(umo):
+            target = self._best_available(MODE_IMAGE, allow_cooldown=True)
+            if target is not None:
+                if target is not resolved:
+                    self.logger.info(
+                        "[自动切换模型] 本次是图像请求，按 image_models 改用 %s",
+                        self._pid(target),
+                    )
+                return target
+            self.logger.warning(
+                "[自动切换模型] 本次是图像请求，但 image_models 为空或没有可用模型，"
+                "沿用 %s（图片可能被丢弃）。",
+                self._pid(resolved) if resolved is not None else "None",
+            )
             return resolved
 
         text_list = self._list_of(MODE_TEXT)
@@ -490,6 +566,10 @@ class SwitchModelPlugin(Star):
         self._remove_patches()
         self._remove_resolver_hook()
         self._remove_manager_hook()
+        self._remove_image_observer()
+        self._image_cache.clear()
+        self._defer_tokens.clear()
+        self._safe_image_cache.clear()
         self.logger.info("[自动切换模型] 已卸载，Provider 钩子已还原。")
 
     # ------------------------------------------------------------------ 配置读取
@@ -535,7 +615,9 @@ class SwitchModelPlugin(Star):
         return [str(x).strip() for x in raw if isinstance(x, str) and x.strip()]
 
     def _list_of(self, mode: str = MODE_TEXT) -> list[str]:
-        """取文本模型的手动优先级列表。"""
+        """取某一类模型的优先级列表（文本 / 图像）。"""
+        if mode == MODE_IMAGE:
+            return self._as_id_list(self.config.get("image_models"))
         items = self._as_id_list(self.config.get("text_models"))
         if not items:
             # 兼容 1.0.0 的配置：老的 models 列表就是文本列表
@@ -569,10 +651,12 @@ class SwitchModelPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any = None, *args, **kwargs) -> None:
-        """请求发出前的最后一道加工：抑制正文里重复的 @。"""
+        """请求发出前的最后一道加工：抑制正文 @、补挂先到的图片。"""
         if req is None or not self._cfg_bool("enabled", True):
             return
         self._inject_no_text_mention(req)
+        self._bridge_cached_images(event, req)
+        await self._prepare_images_for_model(req)
 
     def _inject_no_text_mention(self, req: Any) -> None:
         """告诉模型别在正文里写 @——平台已经自动 @ 了，重复写会显示成多个 @。"""
@@ -719,6 +803,12 @@ class SwitchModelPlugin(Star):
             response = getattr(target, "response", None)
             status = getattr(response, "status_code", None)
             if status is not None:
+                try:
+                    code = int(status)
+                except (TypeError, ValueError):
+                    code = 0
+                if code in _HTTP_ERROR_CODES:
+                    return True, "HTTP %s" % code
                 texts.append(str(status))
 
         blob = "\n".join(t for t in texts if t)
@@ -750,10 +840,22 @@ class SwitchModelPlugin(Star):
             return ""
 
     def _should_switch(self, target: Any) -> tuple[bool, str]:
-        hit, fragment = self._match(target)
-        if hit:
-            return True, fragment
-        if self._is_err_response(target) and self._cfg_bool("match_response_text", True):
+        """这次返回/异常是否该触发切换。
+
+        只有「异常」才拿整个对象做匹配（里面才有 status_code、body 这些真凭据）；
+        正常响应只比对 completion_text —— 否则 str(LLMResponse) 里的 token 数、
+        请求 ID、时间戳都可能凑出 403/401 这类裸数字，造成误判。
+        """
+        if isinstance(target, BaseException):
+            hit, fragment = self._match(target)
+            return (True, fragment) if hit else (False, "")
+
+        if self._is_err_response(target):
+            # 错误响应：正文就是错误信息，一律参与匹配
+            hit, fragment = self._match(self._text_of(target))
+            return (True, fragment) if hit else (False, "")
+
+        if self._cfg_bool("match_response_text", True):
             hit, fragment = self._match(self._text_of(target))
             if hit:
                 return True, fragment
@@ -1063,7 +1165,9 @@ class SwitchModelPlugin(Star):
         if not (self._patched_ready or _HOOKS_INSTALLED):
             return await orig(provider, *args, **kwargs)
 
-        mode = MODE_TEXT
+        # 候选集跟着「实际被调用的模型」走：视觉模型失败时继续在图像列表里换，
+        # 文本模型失败时仍走 text_models，不会互相串台
+        mode = MODE_IMAGE if pid in set(self._list_of(MODE_IMAGE)) else MODE_TEXT
 
         # 闸门放在 persist 判断之前：内部辅助调用（标题生成等）同样不许越界，
         # 但只有主调用会在被拦截时直接报错。
@@ -1104,7 +1208,7 @@ class SwitchModelPlugin(Star):
                 yield chunk
             return
 
-        mode = MODE_TEXT
+        mode = MODE_IMAGE if pid in set(self._list_of(MODE_IMAGE)) else MODE_TEXT
         provider, pid, new_orig, blocked = self._enforce_allowlist(provider, mode, "text_chat_stream")
         if new_orig is not None:
             orig = new_orig
@@ -1196,6 +1300,682 @@ class SwitchModelPlugin(Star):
             return None
 
     # ------------------------------------------------------------------ 指令
+
+    # ------------------------------------------------------------ 图片补挂 / 转码
+    def _install_image_observer(self) -> None:
+        """旁路观察每条入站消息：只要带图就先记下来。
+
+        为什么不用 `@filter.event_message_type(ALL)`：那类 handler 会参与唤醒判定，
+        加了等于把所有群消息都变成「需要响应」。这里改在 EventBus 打日志的位置旁挂，
+        只读、不改事件、不影响唤醒，即使后续被别的插件 `stop_event()` 也照样记得住。
+        """
+        if self._image_hook_orig is not None:
+            return
+        try:
+            from astrbot.core.event_bus import EventBus
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[自动切换模型] 无法挂载图片观察器（%s），图片补挂退化为仅请求阶段。", exc)
+            return
+        original = getattr(EventBus, "_print_event", None)
+        if not callable(original):
+            self.logger.warning("[自动切换模型] EventBus._print_event 不存在，图片补挂退化为仅请求阶段。")
+            return
+
+        plugin = self
+
+        def patched_print_event(bus_self, event, conf_name):
+            try:
+                active = _ACTIVE_PLUGIN or plugin
+                active._observe_event_images(event)
+            except Exception:  # noqa: BLE001  观察失败绝不能影响主流程
+                pass
+            return original(bus_self, event, conf_name)
+
+        patched_print_event._switch_model_hook = True
+        self._image_hook_orig = original
+        EventBus._print_event = patched_print_event
+        self.logger.info(
+            "[自动切换模型] 图片观察器已挂载：入站图片会缓存 %d 秒，供下一条 @ 提问补挂。",
+            self._cfg_int("image_bridge_ttl", 120),
+        )
+
+    def _remove_image_observer(self) -> None:
+        if self._image_hook_orig is None:
+            return
+        try:
+            from astrbot.core.event_bus import EventBus
+
+            EventBus._print_event = self._image_hook_orig
+        except Exception:  # noqa: BLE001
+            pass
+        self._image_hook_orig = None
+
+    @staticmethod
+    def _image_ref(comp: Any) -> str:
+        """取一个图片引用，优先选“活得久”的那一种。
+
+        顺序：http(s) 链接 → file/file:// → 本地 path。
+        本地 path 由 AstrBot 的事件级临时目录托管，事件结束即可能被清理，
+        缓存 20 秒后再用就会 FileNotFoundError；CDN 链接则还能重新下载。
+        """
+        for attr in ("url", "file"):
+            value = getattr(comp, attr, None)
+            if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+                return value.strip()
+        for attr in ("file", "path"):
+            value = getattr(comp, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _ref_key(ref: str) -> str:
+        """把图片引用归一化成去重键：同一张图的不同写法得到同一个键。
+
+        QQ 的图片链接形如 `https://multimedia.nt.qq.com.cn/download?appid=...&fileid=...&rkey=...`，
+        所有图片的路径都一样，**唯一身份在 `fileid`**；`rkey` 每次刷新都会变，不能进键。
+        旧实现直接砍掉查询串，导致「不同图片被合并成一张」和「同一张图的 URL/本地路径
+        被算成两张」两种错法同时存在。
+        """
+        text = str(ref or "").strip()
+        if not text:
+            return ""
+        if text.startswith("file://"):
+            text = text[7:]
+        if text.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlparse(text)
+            query = urllib.parse.parse_qs(parsed.query)
+            ident = (query.get("fileid") or [""])[0].strip()
+            if ident:
+                return "url:" + parsed.netloc.lower() + "/" + ident
+            # 无 fileid 的普通链接：保留查询串，避免把不同资源合并
+            return "url:" + parsed.path.lower() + ("?" + parsed.query.lower() if parsed.query else "")
+        if text.startswith("base64://"):
+            return "b64:" + hashlib.sha1(text[9:].encode("utf-8", "replace")).hexdigest()
+        return "path:" + os.path.basename(text).lower()
+
+    def _collect_images(self, event: AstrMessageEvent) -> list[str]:
+        """从消息链里取出图片引用，并去掉同一条消息内的重复项。
+
+        QQ 发动图时 NapCat 常在一条消息里同时给出 `image` 段和 `file` 段，
+        两者指向同一张图（一个 CDN 链接、一个容器内本地路径）。旧逻辑把它们
+        当成两张：链接那张可能因截断被 AstrBot 跳过，本地路径那张在 AstrBot
+        容器里根本不存在（FileNotFoundError），最终模型一张图也拿不到。
+        这里按「有 image 段就不用 file 段」+ 归一化键去重，一张图只算一次。
+        """
+        try:
+            chain = list(getattr(event.message_obj, "message", None) or [])
+        except Exception:  # noqa: BLE001
+            return []
+
+        primary: list[str] = []
+        fallback: list[str] = []
+        for comp in chain:
+            name = type(comp).__name__
+            if name == "Image":
+                ref = self._image_ref(comp)
+                if ref:
+                    primary.append(ref)
+            elif name == "File" and self._file_suffix(comp) in _IMAGE_EXT:
+                ref = self._image_ref(comp)
+                if ref:
+                    fallback.append(ref)
+
+        # image 段优先；整条消息没有 image 段时才退回 file 段
+        refs = primary or fallback
+        unique: list[str] = []
+        seen: set[str] = set()
+        for ref in refs:
+            key = self._ref_key(ref)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(ref)
+        return unique
+
+    def _observe_event_images(self, event: AstrMessageEvent) -> None:
+        """事件总线旁路：入站消息带图就缓存（同步、只读）。"""
+        if not self._cfg_bool("enabled", True):
+            return
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return
+        try:  # 机器人自己发的消息（表情包等）不算用户输入
+            if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        refs = self._capture_images_once(event, umo)
+        if refs:
+            self.logger.debug(
+                "[自动切换模型] 观察到 %d 张图片，已缓存待补挂（umo=%s）", len(refs), umo
+            )
+
+    def _prune_images(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        cache = getattr(self, "_image_cache", None)
+        if not cache:
+            return
+        for key, (_, expire) in list(cache.items()):
+            if expire < now:
+                cache.pop(key, None)
+
+    def _capture_images_once(self, event: AstrMessageEvent, umo: str) -> list[str]:
+        """同一条消息只采集一次，返回本次新采集到的引用。
+
+        观察器与 `on_waiting_llm_request` 都会调用；靠 message_id 判重，
+        避免同一张图被「URL 版」和「本地文件名版」各记一次。
+        """
+        msg_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
+        if msg_id and self._image_msg_id.get(umo) == msg_id:
+            return []
+        refs = self._collect_images(event)
+        if not refs:
+            return []
+        if msg_id:
+            self._image_msg_id[umo] = msg_id
+        self._store_images(umo, refs)
+        return refs
+
+    def _touch_images(self, umo: str, ttl: int) -> None:
+        """只延长已缓存图片的有效期，不重复采集（等待期间用）。"""
+        item = (getattr(self, "_image_cache", None) or {}).get(umo)
+        if not item:
+            return
+        self._image_cache[umo] = (item[0], time.time() + max(0, ttl))
+
+    def _store_images(self, umo: str, refs: list[str], ttl: int | None = None) -> int:
+        if ttl is None:
+            ttl = self._cfg_int("image_bridge_ttl", 120)
+        if ttl <= 0 or not refs:
+            return 0
+        if not isinstance(getattr(self, "_image_cache", None), dict):
+            self._image_cache = {}
+        now = time.time()
+        self._prune_images(now)
+        current, _ = self._image_cache.get(umo, ([], 0.0))
+        merged: list[str] = []
+        seen_keys: set[str] = set()
+        for ref in list(current) + [r for r in refs if r]:
+            key = self._ref_key(ref)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            merged.append(ref)
+        # 只保留最近几张，避免连发图片把请求撑爆
+        merged = merged[-_MAX_BRIDGE_IMAGES:]
+        self._image_cache[umo] = (merged, now + ttl)
+        return len(refs)
+
+    def _peek_images(self, umo: str | None) -> list[str]:
+        if not umo:
+            return []
+        now = time.time()
+        self._prune_images(now)
+        item = (getattr(self, "_image_cache", None) or {}).get(umo)
+        if not item or item[1] < now:
+            return []
+        return list(item[0])
+
+    def _take_images(self, umo: str | None) -> list[str]:
+        """取走并清空（一次性补挂，避免后续每条消息都重复带图）。"""
+        refs = self._peek_images(umo)
+        if umo:
+            (getattr(self, "_image_cache", None) or {}).pop(umo, None)
+        return refs
+
+    def _has_cached_images(self, umo: str | None) -> bool:
+        return bool(self._peek_images(umo))
+
+    @staticmethod
+    def _file_suffix(comp: Any) -> str:
+        raw = ""
+        for attr in ("name", "file_", "file", "url"):
+            value = getattr(comp, attr, None)
+            if isinstance(value, str) and value:
+                raw = value
+                break
+        if not raw:
+            return ""
+        match = re.search(r"(\.[A-Za-z0-9]{2,5})(?:$|[?#])", raw)
+        return match.group(1).lower() if match else ""
+
+    def _should_defer_image(self, event: AstrMessageEvent) -> bool:
+        """纯图片消息是否该等用户追问，而不是立刻回一句看图感想。"""
+        if not self._cfg_bool("image_wait_followup", True):
+            return False
+        # 不缓存就别扣住消息，否则图直接丢了
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return False
+        if (getattr(event, "message_str", "") or "").strip():
+            return False
+
+        try:
+            chain = list(getattr(event.message_obj, "message", None) or [])
+        except Exception:  # noqa: BLE001
+            return False
+        for comp in chain:
+            name = type(comp).__name__
+            if name in ("Reply", "At", "AtAll"):
+                # 已经 @ 了机器人 / 引用了某条消息 → 用户就是在发起提问，正常处理
+                return False
+        return True
+
+    def _wait_seconds(self) -> int:
+        """纯图片消息在自动回复前等多久。
+
+        与 `image_bridge_ttl`（补挂有效期）解耦：等待只影响响应速度，
+        补挂有效期影响「发图后多久内追问还能把图带上」，两者诉求不同。
+        未配置时退回旧行为（沿用 image_bridge_ttl）。
+        """
+        raw = self.config.get("image_wait_seconds")
+        if raw is None or str(raw).strip() == "":
+            return max(0, min(self._cfg_int("image_bridge_ttl", 120), 600))
+        return max(0, min(self._cfg_int("image_wait_seconds", 10), 600))
+
+    def _bridge_cached_images(self, event: AstrMessageEvent, req: Any) -> None:
+        """把先前缓存的图片补挂到本次请求上。
+
+        `OnLLMRequestEvent` 早于 `prepare_request_images()`，所以这里改 `req.image_urls`
+        能真正进入模型输入；晚于此再改就来不及了。
+        """
+        if self._cfg_int("image_bridge_ttl", 120) <= 0:
+            return
+        umo = getattr(event, "unified_msg_origin", None)
+        # 本条消息自己就带图（纯图片消息等待超时后自动回复走的就是这条）：
+        # req 里已经有这张图，再从缓存补一份只会得到「本地路径 + CDN URL」两份引用；
+        # 同时把缓存清掉，避免这张旧图被粘到后面的文字提问上。
+        if self._collect_images(event):
+            (self._image_cache or {}).pop(umo, None)
+            return
+        if not self._has_cached_images(umo):
+            return
+
+        current = [str(x) for x in (getattr(req, "image_urls", None) or []) if x]
+        cached = self._take_images(umo)
+        if cached:
+            # 图片已被本次请求取走，说明「追问」到了；仍在等待的那条纯图片消息应放弃回复，
+            # 否则会出现一条图片两次回答。
+            self._defer_tokens[umo] = self._defer_tokens.get(umo, 0) + 1
+        merged: list[str] = []
+        seen_keys: set[str] = set()
+        for ref in current + cached:
+            key = self._ref_key(ref)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            merged.append(ref)
+        if len(merged) <= len(current):
+            return
+        req.image_urls = merged
+        added = len(merged) - len(current)
+        event.set_extra("_switch_model_bridged_images", added)
+        self.logger.info(
+            "[自动切换模型] 已把先前记录的 %d 个图片引用补挂到本次请求（本次共 %d 个）",
+            added,
+            len(merged),
+        )
+
+    def _safe_image_dir(self) -> str:
+        """插件自己的图片目录：<data>/plugin_data/<插件名>/image_safe。
+
+        __file__ 是 <data>/plugins/<插件名>/main.py，因此要向上退三级才到 <data>。
+        """
+        data_dir = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        return os.path.join(data_dir, "plugin_data", PLUGIN_NAME, "image_safe")
+
+    def _safe_image_max_side(self) -> int:
+        """转码后的最长边，跟随 AstrBot 自己的图片压缩设置。"""
+        try:
+            opts = (
+                (self.context.get_config().get("provider_settings") or {})
+                .get("image_compress_options")
+                or {}
+            )
+            value = int(opts.get("max_size", 1024))
+            return min(max(value, 256), 2048)
+        except Exception:  # noqa: BLE001
+            return 1024
+
+    async def _prepare_images_for_model(self, req: Any) -> None:
+        """请求发出前把图片统一换成合规 PNG，并收敛重复项。
+
+        AstrBot 的 prepare_model_image 对动图会 load() 全部帧，文件尾部稍有截断
+        就抛 OSError 并把整张图跳过，模型只能回「看不到图」。这里先自己解码一次：
+        动图取首帧、容忍截断、本地路径失效时回退到链接重下，产出标准 PNG。
+        AstrBot 拿到的是合规静态图，会走「原样复用」分支，不再触发解码失败。
+
+        收敛分两级：
+        1. 按引用键去重（同一 URL 的 rkey 变体）；
+        2. 按转码结果去重（不同引用指向同一份字节），再丢弃同一张图的缩略图——
+           QQ 常在同一条消息里同时上报原图与预览图，两张都送进模型是纯浪费。
+        """
+        if not self._cfg_bool("image_safe_transcode", False):
+            return
+        refs = [str(x) for x in (getattr(req, "image_urls", None) or []) if x]
+        if not refs:
+            return
+
+        items: list[tuple[str, bool]] = []  # (最终引用, 是否由我们转码)
+        seen_keys: set[str] = set()
+        for ref in refs:
+            key = self._ref_key(ref)
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            safe = await self._to_model_safe_image(ref)
+            items.append((safe or ref, bool(safe and safe != ref)))
+
+        items = self._drop_same_result(items)
+        after_same = len(items)
+        items = self._drop_thumbnails(items) if self._cfg_bool(
+            "image_drop_thumbnails", True
+        ) else items
+
+        out = [ref for ref, _ in items]
+        converted = sum(1 for _, done in items if done)
+        if converted or len(out) != len(refs):
+            req.image_urls = out
+            self.logger.info(
+                "[自动切换模型] 图片预处理：收到 %d 个引用 → 去重后 %d 张 → 丢弃缩略图后 %d 张"
+                "（其中转码 %d 张）",
+                len(refs),
+                after_same,
+                len(out),
+                converted,
+            )
+
+    @staticmethod
+    def _drop_same_result(items: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+        """不同引用转出同一个文件（内容相同）时只保留一份。"""
+        out: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for ref, done in items:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            out.append((ref, done))
+        return out
+
+    def _drop_thumbnails(self, items: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+        """丢掉同一条消息里「同一张图的预览图」。
+
+        判据（三条同时满足才丢，尽量不误伤）：
+        - 两张都是本地文件（只处理我们自己转码出来的图）；
+        - 宽高比相对误差小于 5%；
+        - 小图面积不足大图的一半。
+        """
+        sized: list[tuple[int, float, tuple[str, bool]]] = []
+        for item in items:
+            path = item[0]
+            if not os.path.isfile(path):
+                continue
+            size = self._image_pixel_size(path)
+            if not size:
+                continue
+            width, height = size
+            if width <= 0 or height <= 0:
+                continue
+            sized.append((width * height, width / height, item))
+        if len(sized) < 2:
+            return items
+
+        drop: set[str] = set()
+        for area, ratio, (ref, _) in sized:
+            for other_area, other_ratio, (other_ref, _) in sized:
+                if ref == other_ref or ref in drop:
+                    continue
+                if other_area <= area:
+                    continue
+                if area * 2 > other_area:
+                    continue
+                if abs(ratio - other_ratio) / other_ratio > 0.05:
+                    continue
+                drop.add(ref)
+                self.logger.info(
+                    "[自动切换模型] 丢弃缩略图：%s（%d 像素，主图 %d 像素）",
+                    os.path.basename(ref),
+                    area,
+                    other_area,
+                )
+                break
+        if not drop:
+            return items
+        return [item for item in items if item[0] not in drop]
+
+    @staticmethod
+    def _image_pixel_size(path: str) -> tuple[int, int] | None:
+        """只读文件头拿宽高，不解码像素。"""
+        try:
+            from PIL import Image as PILImage
+
+            with PILImage.open(path) as image:
+                return image.size
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _to_model_safe_image(self, ref: str) -> str | None:
+        """把一个图片引用转成本地合规 PNG；失败返回 None（调用方保留原引用）。"""
+        text = str(ref or "").strip()
+        if not text:
+            return None
+
+        out_dir = self._safe_image_dir()
+        if text.startswith(out_dir):
+            return text if os.path.isfile(text) else None
+
+        key = self._ref_key(text)
+        hit = self._safe_image_cache.get(key)
+        if hit and hit[1] > time.time() and os.path.isfile(hit[0]):
+            return hit[0]
+
+        try:
+            raw = await self._read_image_ref(text)
+            if not raw:
+                self.logger.warning(
+                    "[自动切换模型] 图片取不到，已跳过：%s", text[-60:]
+                )
+                return None
+            safe = await asyncio.to_thread(self._encode_safe_image, raw)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "[自动切换模型] 图片转码异常（%s）：%s", type(exc).__name__, str(exc)[:120]
+            )
+            return None
+        if safe and key:
+            self._safe_image_cache[key] = (safe, time.time() + 600)
+        return safe
+
+    async def _read_image_ref(self, ref: str) -> bytes | None:
+        """读出图片字节：base64 / 本地文件 / 链接下载，依次尝试。"""
+        if ref.startswith("base64://"):
+            try:
+                return base64.b64decode(ref[9:])
+            except Exception:  # noqa: BLE001
+                return None
+
+        path = ref[7:] if ref.startswith("file://") else ref
+        if not path.startswith(("http://", "https://")):
+            try:
+                if os.path.isfile(path):
+                    if os.path.getsize(path) > _MAX_SAFE_IMAGE_BYTES:
+                        return None
+                    with open(path, "rb") as fh:
+                        return fh.read()
+            except OSError:
+                return None
+            # 本地路径失效（事件结束被清理，或属于 NapCat 容器）→ 交给下载兜底
+            return None
+
+        return await self._download_image(path)
+
+    async def _download_image(self, url: str) -> bytes | None:
+        try:
+            import httpx
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code != 200:
+                        return None
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > _MAX_SAFE_IMAGE_BYTES:
+                            return None
+                    return bytes(buf)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _encode_safe_image(self, raw: bytes) -> str | None:
+        """同步解码并转 PNG：动图取首帧、容忍截断。CPU 密集，放在线程里跑。"""
+        try:
+            from PIL import Image as PILImage
+            from PIL import ImageFile, ImageOps
+        except Exception:  # noqa: BLE001
+            return None
+        if not raw or len(raw) > _MAX_SAFE_IMAGE_BYTES:
+            return None
+
+        out_dir = self._safe_image_dir()
+        digest = hashlib.sha1(raw).hexdigest()
+        target = os.path.join(out_dir, "safe_%s.png" % digest[:16])
+        if os.path.isfile(target):
+            return target
+
+        max_side = self._safe_image_max_side()
+        tmp = target + ".tmp"
+        try:
+            with _PIL_TRUNCATE_LOCK:
+                previous = ImageFile.LOAD_TRUNCATED_IMAGES
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+                try:
+                    with PILImage.open(io.BytesIO(raw)) as image:
+                        try:
+                            image.seek(0)  # 动图只取首帧，避开全帧解码
+                        except Exception:  # noqa: BLE001
+                            pass
+                        oriented = ImageOps.exif_transpose(image)
+                        bands = oriented.getbands()
+                        if oriented.mode not in ("RGB", "RGBA"):
+                            oriented = oriented.convert(
+                                "RGBA" if "A" in bands else "RGB"
+                            )
+                        oriented.thumbnail((max_side, max_side))
+                        os.makedirs(out_dir, exist_ok=True)
+                        oriented.save(tmp, format="PNG", optimize=True)
+                finally:
+                    ImageFile.LOAD_TRUNCATED_IMAGES = previous
+            os.replace(tmp, target)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            self.logger.debug(
+                "[自动切换模型] 转码放弃（%s）：%s", type(exc).__name__, str(exc)[:100]
+            )
+            return None
+
+        self._prune_safe_images(out_dir)
+        return target
+
+    def _prune_safe_images(self, out_dir: str, keep: int = 300) -> None:
+        """兜底清理：目录里文件过多时删最旧的，避免长期运行堆满存储。"""
+        try:
+            files = [
+                os.path.join(out_dir, name)
+                for name in os.listdir(out_dir)
+                if name.startswith("safe_") and name.endswith(".png")
+            ]
+            if len(files) <= keep:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p))
+            for path in files[: len(files) - keep]:
+                os.remove(path)
+        except OSError:
+            return
+
+    @filter.on_waiting_llm_request()
+    async def on_waiting_llm_request(self, event: AstrMessageEvent, *args, **kwargs) -> None:
+        """纯图片消息先不抢答：缓存图片，等用户追问时一起送给模型。"""
+        if not self._cfg_bool("enabled", True):
+            return
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return
+        # 先登记「本次带图」：本条带图，或本会话还有待补挂的图
+        if self._collect_images(event) or self._has_cached_images(umo):
+            self._mark_image_request(umo)
+        if event.get_extra("_switch_model_defer_passthrough"):
+            return
+        if not self._should_defer_image(event):
+            return
+        # 观察器通常已经存过；这里用 message_id 兜底，同一条消息不会重复写
+        self._capture_images_once(event, umo)
+        await self._defer_or_reply(event, umo)
+
+    async def _defer_or_reply(self, event: AstrMessageEvent, umo: str) -> bool:
+        """纯图片消息：等追问，或超时后自己回复。
+
+        返回 True 表示「超时了，继续走管线，本条消息自己回答」；
+        返回 False 表示本次不该继续（已拦截等追问，或追问已经回答过了）。
+        """
+        wait = self._wait_seconds()
+        bridge_ttl = max(0, self._cfg_int("image_bridge_ttl", 120))
+
+        # 关闭自动回复 → 保持旧行为：扣住消息等追问
+        if not self._cfg_bool("image_defer_auto_reply", True):
+            event.stop_event()
+            self.logger.info(
+                "[自动切换模型] 收到纯图片消息，已记录 %d 个图片引用，等你追问时一起送给模型（%d 秒内有效）",
+                len(self._peek_images(umo)),
+                bridge_ttl,
+            )
+            return False
+
+        # 等待时长填 0 = 不等待，立刻看图回答
+        if wait <= 0:
+            self.logger.info("[自动切换模型] 等待时长设为 0，跳过等待，直接解析图片并回复。")
+            return True
+
+        wait = max(1, wait)
+        # 缓存要活到等待结束之后，否则解析阶段拿不到图
+        keep = max(wait, bridge_ttl) + 120
+        self._touch_images(umo, keep)
+        token = self._defer_tokens.get(umo, 0)
+        self.logger.info(
+            "[自动切换模型] 收到纯图片消息，已记录 %d 个图片引用；先等 %d 秒，"
+            "期间追问则合并回答，超时则自动解析图片并回复。",
+            len(self._peek_images(umo)),
+            wait,
+        )
+        try:
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            raise
+
+        if self._defer_tokens.get(umo, 0) != token:
+            # 等待期间图片已被另一条请求取走 → 那条请求已经回答，这里不再重复
+            event.stop_event()
+            self.logger.info(
+                "[自动切换模型] 等待期间已收到追问，本次图片消息交由追问一起处理，不再重复回复。"
+            )
+            return False
+
+        event.set_extra("_switch_model_defer_passthrough", True)
+        self.logger.info("[自动切换模型] 等待 %d 秒未收到追问，开始解析图片并直接回复。", wait)
+        return True
+
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("switchmodel")
