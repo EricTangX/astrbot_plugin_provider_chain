@@ -1,156 +1,130 @@
 {
-  "enabled": {
-    "description": "启用插件",
-    "type": "bool",
-    "hint": "关闭后不再挂钩任何 Provider 调用，等同卸载。",
-    "default": true
-  },
-  "error_keywords": {
-    "description": "触发切换的错误关键词",
-    "type": "list",
-    "hint": "命中任意一条即触发切换。substring 模式下为「包含即命中」；regex 模式下每条按正则解析。",
-    "default": [
-      "Free quota exhausted",
-      "AllocationQuota.FreeTierOnly",
-      "insufficient_quota",
-      "insufficient balance",
-      "quota",
-      "rate limit",
-      "RateLimitError",
-      "429",
-      "403",
-      "401",
-      "402",
-      "invalid_api_key",
-      "InvalidApiKey",
-      "model_not_found",
-      "All chat models failed",
-      "service unavailable",
-      "502",
-      "503"
-    ]
-  },
-  "match_mode": {
-    "description": "关键词匹配方式",
-    "type": "string",
-    "hint": "substring = 子串包含；regex = 正则表达式。选项：substring / regex",
-    "default": "substring"
-  },
-  "ignore_case": {
-    "description": "忽略大小写",
-    "type": "bool",
-    "hint": "开启后 403 也能匹配 free quota 之类的英文关键词。",
-    "default": true
-  },
-  "match_response_text": {
-    "description": "同时检查返回内容",
-    "type": "bool",
-    "hint": "有些 Provider 不抛异常，而是返回 role=err 的响应文本。开启后会对文本再做一次关键词判定。",
-    "default": true
-  },
-  "strategy": {
-    "description": "列表排序策略",
-    "type": "string",
-    "hint": "order = 按下面三份列表的顺序（推荐）；alphabetical = 忽略列表顺序，按模型 ID 字典序。",
-    "default": "order"
-  },
-  "text_models": {
-    "description": "文本模型优先级（有序）",
-    "type": "list",
-    "_special": "select_providers",
-    "hint": "点下方输入框从已启用模型里勾选，选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级：第一名是首选，报错后依次往后。留空 = 沿用 WebUI 里设置的主模型；一旦勾了列表，文本请求就以第一项为准。",
-    "default": []
-  },
-  "image_models": {
-    "description": "图像模型优先级（有序）",
-    "type": "list",
-    "_special": "select_providers",
-    "hint": "消息里带图片时使用，请只勾能看图的模型。留空 = 图像请求不做特殊处理，交给 AstrBot 原逻辑。勾选顺序即优先级。",
-    "default": []
-  },
-  "audio_models": {
-    "description": "音频模型优先级（有序）",
-    "type": "list",
-    "_special": "select_providers",
-    "hint": "消息里带语音/音频时使用，请只勾能听音频的对话模型。留空 = 音频请求不做特殊处理。语音若已被 STT 转成文字，则按文本请求走。勾选顺序即优先级。",
-    "default": []
-  },
-  "image_wait_followup": {
-    "description": "纯图片消息先不回复，等你追问",
-    "type": "bool",
-    "hint": "QQ 不支持 @ 和图片放在同一条消息里，只能先发图、再 @ 提问。开启后，收到「只有图、没有文字也没有 @」的消息时不立即回复，先把图缓存下来；你接着 @ 提问时，图会被补挂进那次请求，模型才看得见。关闭则维持原状：发图就立刻回一句看图感想。",
-    "default": true
-  },
-  "image_bridge_ttl": {
-    "description": "缓存图片的有效期（秒）",
-    "type": "int",
-    "hint": "发完图后多久内提问还能把图带上。默认 120 秒，够「发图 → 打 @ → 打字」。填 0 = 关闭图片补挂（回到旧行为，@ 提问时模型看不到先发的图）。图片只在内存里保留引用，不下载、不落盘。",
-    "default": 120
-  },
-  "suppress_text_mention": {
-    "description": "抑制回复正文里的 @",
-    "type": "bool",
-    "hint": "AstrBot 会按「回复时 @ 发送者」自动加一个 @，而模型从上下文里学会了在正文开头再写「@昵称(QQ号)」，两处叠加就会显示成 2~3 个重复的 @。开启后会在系统提示词里加一句约束，让模型不要在正文写 @（需要提到某人时直接说名字）。关闭则维持原状。",
-    "default": true
-  },
-  "auto_sync_provider_models": {
-    "description": "自动同步 AstrBot 里选中的模型到列表首位",
-    "type": "bool",
-    "hint": "开启后，当你在「模型提供商」里修改主对话模型、图片转述模型或语音识别模型时，插件会自动把它提到对应列表的首位（已在列表里就上移，不在就新增），不用再手动回来添加。列表为空时不处理——空列表本来就代表「跟随 AstrBot 默认」。",
-    "default": true
-  },
-  "auto_sync_interval_seconds": {
-    "description": "模型设置同步的检查间隔（秒）",
-    "type": "int",
-    "hint": "插件每隔多少秒检查一次上述三处设置有没有被改动。默认 20 秒，范围 5~600。改小更及时，但会略微增加配置读取频率。",
-    "default": 20
-  },
-  "auto_append_enabled": {
-    "description": "文本列表未列出的模型自动追加",
-    "type": "bool",
-    "hint": "仅对 text_models 生效：开启后不在列表里的已启用对话模型会按 ID 排序追加到队尾，避免漏配导致无候选。图像/音频列表不会自动追加（能力未知，不替你猜）。",
-    "default": true
-  },
-  "max_chain": {
-    "description": "单次最多尝试的候选数",
-    "type": "int",
-    "hint": "一次报错最多连续尝试几个模型，防止长时间卡住。建议 2~4。",
-    "default": 4
-  },
-  "cooldown_seconds": {
-    "description": "失败模型冷却时长（秒）",
-    "type": "int",
-    "hint": "判定失败的模型在此时间内不再作为候选，冷却结束自动恢复，避免反复撞同一个额度耗尽的模型。",
-    "default": 180
-  },
-  "failure_policy": {
-    "description": "模型连续失败后的处理策略",
-    "type": "string",
-    "hint": "同一模型在同一类请求里连续失败达到阈值后执行：none = 只做冷却（保持旧行为）；demote = 降到该列表末尾，仍然参与切换但排最后；remove = 从列表移除，并在本次运行内不再选它（重启后恢复）。默认 demote。",
-    "default": "demote"
-  },
-  "failure_threshold": {
-    "description": "触发处理策略的连续失败次数",
-    "type": "int",
-    "hint": "默认 3，范围 1~20。只统计「连续」失败：中间成功一次就清零，重新计数。",
-    "default": 3
-  },
-  "persist_switch": {
-    "description": "持久化切换结果",
-    "type": "bool",
-    "hint": "开启后会改写 cmd_config.json 里的 agent_runner.config.model.provider_id，使重启后依然生效；关闭则只在本次运行内生效。图像/音频请求的切换不受此项影响，始终只作用于本次。",
-    "default": true
-  },
-  "warn_when_empty": {
-    "description": "无候选时输出错误日志",
-    "type": "bool",
-    "hint": "所有候选都在冷却或未配置时，是否打一条 ERROR 日志便于排查。",
-    "default": true
-  },
-  "mode_ttl": {
-    "description": "请求类型判定有效期（秒）",
-    "type": "int",
-    "hint": "从收到消息到解析模型的间隔通常远小于 1 秒；此值只用于兜底，避免残留的类型判定影响后续无关请求。建议 15~60。",
-    "default": 30
-  }
+    "enabled": {
+        "description": "启用插件",
+        "type": "bool",
+        "hint": "关闭后不再挂钩任何 Provider 调用，等同卸载。",
+        "default": true
+    },
+    "error_keywords": {
+        "description": "触发切换的错误关键词",
+        "type": "list",
+        "hint": "命中任意一条即触发切换。substring 模式下为「包含即命中」；regex 模式下每条按正则解析。",
+        "default": [
+            "Free quota exhausted",
+            "AllocationQuota.FreeTierOnly",
+            "insufficient_quota",
+            "insufficient balance",
+            "quota",
+            "rate limit",
+            "RateLimitError",
+            "429",
+            "403",
+            "401",
+            "402",
+            "invalid_api_key",
+            "InvalidApiKey",
+            "model_not_found",
+            "All chat models failed",
+            "service unavailable",
+            "502",
+            "503"
+        ]
+    },
+    "match_mode": {
+        "description": "关键词匹配方式",
+        "type": "string",
+        "hint": "substring = 子串包含；regex = 正则表达式。选项：substring / regex",
+        "default": "substring"
+    },
+    "ignore_case": {
+        "description": "忽略大小写",
+        "type": "bool",
+        "hint": "开启后 403 也能匹配 free quota 之类的英文关键词。",
+        "default": true
+    },
+    "match_response_text": {
+        "description": "同时检查返回内容",
+        "type": "bool",
+        "hint": "有些 Provider 不抛异常，而是返回 role=err 的响应文本。开启后会对文本再做一次关键词判定。",
+        "default": true
+    },
+    "strategy": {
+        "description": "列表排序策略",
+        "type": "string",
+        "hint": "order = 按下面三份列表的顺序（推荐）；alphabetical = 忽略列表顺序，按模型 ID 字典序。",
+        "default": "order"
+    },
+    "strict_allowlist": {
+        "description": "严格候选集（只调用列表内模型）",
+        "type": "bool",
+        "hint": "开启且某类列表非空时，运行期只会调用该列表内的模型：不再自动追加未列出的模型、候选全冷却也不退回 AstrBot 主模型、主模型变更也不会越界；列表内一个可用模型都没有时报错而不是偷偷换用别家模型。关闭 = 允许回退到列表外（旧行为）。",
+        "default": true
+    },
+    "text_models": {
+        "description": "文本模型优先级（有序，留空则跟随 AstrBot 主模型）",
+        "type": "list",
+        "_special": "select_providers",
+        "hint": "点下方输入框从已启用模型里勾选，选中项右侧 ↑ ↓ 可调整顺序，从上到下就是优先级：第一名是首选，报错后依次往后。留空 = 沿用 WebUI 里设置的主模型；一旦勾了列表，文本请求就以第一项为准。",
+        "default": []
+    },
+    "suppress_text_mention": {
+        "description": "抑制回复正文里的 @",
+        "type": "bool",
+        "hint": "AstrBot 会按「回复时 @ 发送者」自动加一个 @，而模型从上下文里学会了在正文开头再写「@昵称(QQ号)」，两处叠加就会显示成 2~3 个重复的 @。开启后会在系统提示词里加一句约束，让模型不要在正文写 @（需要提到某人时直接说名字）。关闭则维持原状。",
+        "default": true
+    },
+    "auto_sync_provider_models": {
+        "description": "自动同步 AstrBot 里选中的模型到列表首位",
+        "type": "bool",
+        "hint": "开启后，当你在「模型提供商」里修改主对话模型、图片转述模型或语音识别模型时，插件会自动把它提到对应列表的首位（已在列表里就上移，不在就新增），不用再手动回来添加。列表为空时不处理——空列表本来就代表「跟随 AstrBot 默认」。",
+        "default": true
+    },
+    "auto_sync_interval_seconds": {
+        "description": "模型设置同步的检查间隔（秒）",
+        "type": "int",
+        "hint": "插件每隔多少秒检查一次上述三处设置有没有被改动。默认 20 秒，范围 5~600。改小更及时，但会略微增加配置读取频率。",
+        "default": 20
+    },
+    "auto_append_enabled": {
+        "description": "文本列表未列出的模型自动追加",
+        "type": "bool",
+        "hint": "仅对 text_models 生效，且严格候选集关闭时才起作用：开启后不在列表里的已启用对话模型会按 ID 排序追加到队尾。严格候选集开启时不追加，避免出现「列表外的模型被调用」。",
+        "default": false
+    },
+    "max_chain": {
+        "description": "单次最多尝试的候选数",
+        "type": "int",
+        "hint": "一次报错最多连续尝试几个模型，防止长时间卡住。建议 2~4。",
+        "default": 4
+    },
+    "cooldown_seconds": {
+        "description": "失败模型冷却时长（秒）",
+        "type": "int",
+        "hint": "判定失败的模型在此时间内不再作为候选，冷却结束自动恢复，避免反复撞同一个额度耗尽的模型。",
+        "default": 180
+    },
+    "failure_policy": {
+        "description": "模型连续失败后的处理策略",
+        "type": "string",
+        "hint": "同一模型在同一类请求里连续失败达到阈值后执行：none = 只做冷却（保持旧行为）；demote = 降到该列表末尾，仍然参与切换但排最后；remove = 从列表移除，并在本次运行内不再选它（重启后恢复）。默认 demote。",
+        "default": "demote"
+    },
+    "failure_threshold": {
+        "description": "触发处理策略的连续失败次数",
+        "type": "int",
+        "hint": "默认 3，范围 1~20。只统计「连续」失败：中间成功一次就清零，重新计数。",
+        "default": 3
+    },
+    "persist_switch": {
+        "description": "持久化切换结果",
+        "type": "bool",
+        "hint": "开启后会改写 cmd_config.json 里的 agent_runner.config.model.provider_id，使重启后依然生效；关闭则只在本次运行内生效。图像/音频请求的切换不受此项影响，始终只作用于本次。",
+        "default": true
+    },
+    "warn_when_empty": {
+        "description": "无候选时输出错误日志",
+        "type": "bool",
+        "hint": "所有候选都在冷却或未配置时，是否打一条 ERROR 日志便于排查。",
+        "default": true
+    }
 }
