@@ -396,7 +396,6 @@ POST /api/plug/astrbot_plugin_switch_model/models   → 请求体为 {text_model
 | 版本 | 变更 |
 |---|---|
 | 1.0.0 | 故障切换：关键词判定、顺序切换、冷却、解析拦截即时生效、落盘持久化、管理指令 |
-| 2.0.x | （已回退）自动读取模型能力做模态路由、降级/报错、图片补挂、请求诊断 |
 | 1.1.0 | 代码基座回到 1.0.0；新增 `text_models` / `image_models` / `audio_models` 三份手动优先级列表与消息分类；新增 `modes` 指令与 `list [类型]` 参数；删除 2.x 的能力嗅探、降级/报错、图片补挂、诊断日志 |
 | 1.2.0 | 新增可视化配置页 `pages/model-priority`：三份列表改为「下拉选模型 + 拖动排序」，选项来自已启用的对话模型并按类型分组；新增 `GET/POST /api/plug/astrbot_plugin_switch_model/models` 接口，带重复/未知模型/非对话模型的校验与能力提醒；保存时清理旧 `models` 键并重置运行时偏好，改完立即生效。配置格式不变，仍为 `list[str]` |
 | 1.3.0 | 插件标识改为 `astrbot_plugin_switch_model`（配合插件市场命名约定），配置文件名随之变为 `astrbot_plugin_switch_model_config.json`；三项优先级在**配置表单里变成原生下拉选择器**（`_special: select_providers`，勾选 + `↑↓` 排序，数据仍是 `list[str]`），插件页面保留为按模态分组/校验的进阶入口；补齐 `metadata.yaml` 的 `repo` / `author` / `tags` / `support_platforms` 以便发布到插件市场；显示名改为「自动切换模型」 |
