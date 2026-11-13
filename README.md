@@ -1,4 +1,4 @@
-# 候选链（Provider Chain）
+# 候选链 · ProviderChain
 
 **AstrBot 插件：模型自动切换 · 文本/图像双优先级 · 失败冷却降级 · 严格候选集 · 发图后补挂。**
 
