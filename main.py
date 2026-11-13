@@ -1,4 +1,4 @@
-"""astrbot_plugin_switch_model 2.0.0 —— 文本模型报错自动切换。
+"""astrbot_plugin_provider_chain 2.1.0 —— 候选链 · ProviderChain。
 
 只保留文本对话模型的故障切换：
 - 按 `text_models` 的顺序挑选本次使用的模型（列表留空则跟随 AstrBot 主模型）；
@@ -35,8 +35,8 @@ from astrbot.core.provider.entities import LLMResponse, ProviderType
 from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.provider import Provider
 
-PLUGIN_NAME = "astrbot_plugin_switch_model"
-VERSION = "2.0.0"
+PLUGIN_NAME = "astrbot_plugin_provider_chain"
+VERSION = "2.1.0"
 
 # 2.0 起配置按功能分成 4 张卡片（_conf_schema.json 里的 object 组），
 # 这里把「逻辑名 → 配置路径」集中一处，避免以后调整结构时又要满地改字符串。
