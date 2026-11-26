@@ -534,7 +534,11 @@ class SwitchModelPlugin(Star):
         """
         now = time.time()
         if umo:
-            return self._image_mode_until.get(umo, 0.0) > now
+            # P0-A: 除 TTL 登记外，还要求本会话缓存中确实有未消费的图片。
+            # 图片被 _take_images 取走后缓存清空，纯文本请求即恢复走文本模型。
+            if self._image_mode_until.get(umo, 0.0) <= now:
+                return False
+            return self._has_cached_images(umo)
         return self._image_mode_global > now
 
     def _apply_preferred(self, provider_type, resolved, umo: str | None = None):
@@ -1664,6 +1668,9 @@ class SwitchModelPlugin(Star):
         refs = self._peek_images(umo)
         if umo:
             (getattr(self, "_image_cache", None) or {}).pop(umo, None)
+            # P0-A: 图片已消费，同步撤销图像模式登记，防止 TTL 残留
+            # 让随后的纯文本追问继续被路由到视觉模型。
+            self._image_mode_until.pop(umo, None)
         return refs
 
     def _has_cached_images(self, umo: str | None) -> bool:
@@ -1729,6 +1736,8 @@ class SwitchModelPlugin(Star):
         # 同时把缓存清掉，避免这张旧图被粘到后面的文字提问上。
         if self._collect_images(event):
             (self._image_cache or {}).pop(umo, None)
+            # P0-A: 本条消息自带图（req 里已有），同样撤销图像模式登记
+            self._image_mode_until.pop(umo, None)
             return
         if not self._has_cached_images(umo):
             return
