@@ -36,7 +36,7 @@ from astrbot.core.provider.manager import ProviderManager
 from astrbot.core.provider.provider import Provider
 
 PLUGIN_NAME = "astrbot_plugin_provider_chain"
-VERSION = "2.1.0"
+VERSION = "2.1.2"
 
 # 2.0 起配置按功能分成 4 张卡片（_conf_schema.json 里的 object 组），
 # 这里把「逻辑名 → 配置路径」集中一处，避免以后调整结构时又要满地改字符串。
